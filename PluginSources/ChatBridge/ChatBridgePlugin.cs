@@ -267,6 +267,14 @@ namespace ChatBridge
 			new ConcurrentDictionary<string, DateTime>();
 
 		private Regex trigger = null!;
+		// 客户端自动补全会把手动输入的 @昵称 改写成 "<@clientId|昵称>"（如 <@431|Mybot>），
+		// 也见过不带 id 的 "<@昵称>"。这是显式提及，与裸 @ 分开判定。
+		// clientId 只丢弃不参与判断：客户端重连后 id 会变，缓存它必然过期。
+		private Regex mentionTag = null!;
+		// TS3 对重名昵称会追加 " (2)" 这类后缀，仍应视为提及本 bot。
+		private static readonly Regex NameSuffix = new Regex(
+			@"^\s*\(\d+\)$", RegexOptions.CultureInvariant | RegexOptions.Compiled);
+		private string selfName = null!;
 		private int initialized;
 		private int runCounter;
 
@@ -296,11 +304,18 @@ namespace ChatBridge
 			var selfName = config.Connect.Name.Value;
 			if (string.IsNullOrWhiteSpace(selfName))
 				throw new InvalidOperationException("bot.connect.name 为空，无法确定 @ 触发词。");
+			this.selfName = selfName;
 
-			// 前一个字符不能是字母数字（排除 a@Mybot.com 这类邮箱），
+			// 裸 @ 形态：前一个字符不能是字母数字（排除 a@Mybot.com 这类邮箱），
 			// 后一个字符必须是行尾、空白或标点（排除 @Mybot2 这类更长昵称）。
 			trigger = new Regex(
 				@"(?<![\w@])@" + Regex.Escape(selfName) + @"(?=$|[\s\p{P}])",
+				RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+			// 补全形态：<@431|Mybot> 或 <@Mybot>。标签本身就是一次显式提及，
+			// 因此不再套用裸 @ 的边界规则，"<@431|Mybot>歌单" 这种紧贴正文的写法也能命中。
+			mentionTag = new Regex(
+				@"<@(?:(?<id>\d+)\|)?(?<name>[^>]+)>",
 				RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
 			ts3.OnMessageReceived += OnMessageReceived;
@@ -339,14 +354,14 @@ namespace ChatBridge
 				string prompt;
 				if (message.Target == TextMessageTargetMode.Private)
 				{
-					prompt = message.Message.Trim();
+					// 私聊不要求 @，但客户端补全仍可能带 <@id|Mybot> 标签，剥掉免得混进正文。
+					prompt = StripSelfMention(message.Message).Trim();
 				}
-				else
+				else if (!TryExtractPrompt(message.Message, out prompt))
 				{
-					var match = trigger.Match(message.Message);
-					if (!match.Success)
-						return; // 频道/服务器消息未 @ 自己：完全忽略
-					prompt = message.Message.Remove(match.Index, match.Length).Trim();
+					Log.Debug("ChatBridge 未命中触发词，忽略消息: uid={0}.. text=[{1}]",
+						uidDbg.Substring(0, Math.Min(4, uidDbg.Length)), preview);
+					return; // 频道/服务器消息未 @ 自己：完全忽略
 				}
 
 				if (prompt.Length == 0)
@@ -461,6 +476,70 @@ namespace ChatBridge
 			{
 				Log.Error(ex, "ChatBridge 处理消息失败");
 			}
+		}
+
+		/// <summary>
+		/// 从频道/服务器消息里取出给模型的 prompt。
+		/// 客户端补全的 "<@431|Mybot>" 优先按显式提及判定：标签本身已确定对象，
+		/// 不再要求后面跟空白，所以 "<@431|Mybot>歌单" 也能命中。
+		/// 裸 "@Mybot" 作为手动输入的兼容形态兜底。
+		/// </summary>
+		private bool TryExtractPrompt(string text, out string prompt)
+		{
+			foreach (Match m in mentionTag.Matches(text))
+			{
+				if (!IsSelfMention(m))
+					continue;
+				prompt = text.Remove(m.Index, m.Length).Trim();
+				return prompt.Length > 0;
+			}
+
+			var match = trigger.Match(text);
+			if (!match.Success)
+			{
+				prompt = string.Empty;
+				return false;
+			}
+			prompt = text.Remove(match.Index, match.Length).Trim();
+			return prompt.Length > 0;
+		}
+
+		/// <summary>
+		/// 私聊不需要 @，但如果里面夹着指向本 bot 的补全标签就剥掉，避免污染 prompt。
+		/// </summary>
+		private string StripSelfMention(string text)
+		{
+			return mentionTag.Replace(text, m => IsSelfMention(m) ? string.Empty : m.Value);
+		}
+
+		/// <summary>
+		/// 判断一个提及标签是否指向本 bot。
+		/// 有 clientId 就以它为准，但必须实时比对——重连后服务器会分配新 id，
+		/// 任何缓存下来的 id 都会过期。没有 id 或 id 尚未同步时才退回昵称。
+		/// </summary>
+		private bool IsSelfMention(Match m)
+		{
+			if (m.Groups["id"].Success
+				&& ushort.TryParse(m.Groups["id"].Value, out var rawId)
+				&& new ClientId(rawId) == ts3.OwnClientId)
+				return true;
+
+			return IsSelfName(m.Groups["name"].Value);
+		}
+
+		/// <summary>
+		/// 标签里的昵称是否是本 bot。昵称可能被服务器改写（重名追加 " (2)"），
+		/// 所以不单靠名字：优先用 id，这里只做为兜底。
+		/// </summary>
+		private bool IsSelfName(string name)
+		{
+			var trimmed = name.Trim();
+			if (string.Equals(trimmed, selfName, StringComparison.OrdinalIgnoreCase))
+				return true;
+			// 服务器对重名昵称会改成 "Mybot (2)"，仍算提及自己。
+			return trimmed.Length > selfName.Length
+				&& trimmed.StartsWith(selfName, StringComparison.OrdinalIgnoreCase)
+				&& NameSuffix.IsMatch(trimmed.Substring(selfName.Length));
 		}
 
 		/// <summary>

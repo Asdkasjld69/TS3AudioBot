@@ -68,6 +68,23 @@ namespace TS3AudioBot
 		public bool Connected => ts3FullClient.Connected;
 		public TsConst ServerConstants => ts3FullClient.ServerConstants;
 
+		/// <summary>
+		/// 本客户端当前的 clientId。重连后由服务器的 InitServer 重新分配，
+		/// 所以不能缓存快照，每次都从 Book 实时读取。
+		/// </summary>
+		public ClientId OwnClientId => ts3FullClient.Book.OwnClient;
+
+		/// <summary>
+		/// 本客户端当前的 uid（身份密钥派生，跨重连稳定）。未连接时可能为 null。
+		/// </summary>
+		public Uid? OwnUid => ts3FullClient.Book.Self()?.Uid;
+
+		/// <summary>
+		/// 本客户端当前的昵称，未连接时为 null。名字可能因重名被服务器改写，
+		/// 因此只作为展示/兜底，不作为唯一身份依据。
+		/// </summary>
+		public string? OwnName => ts3FullClient.Book.Self()?.Name;
+
 		public Ts3Client(ConfBot config, TsFullClient ts3FullClient, Id id)
 		{
 			this.id = id;
