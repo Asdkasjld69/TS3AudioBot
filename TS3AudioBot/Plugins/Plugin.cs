@@ -194,10 +194,23 @@ namespace TS3AudioBot.Plugins
 
 		private PluginResponse PrepareSource()
 		{
-			var param = AppDomain.CurrentDomain.GetAssemblies()
+			// 插件源码是运行时现场编译的，引用集原本只来自「已加载进 AppDomain 的程序集」。
+			// 那些「声明了但还没被触碰」的共享框架程序集不在里面，插件一旦用到就会
+			// 报 type forwarded 错误（例如 System.Net.Http）。这里显式补齐常用程序集。
+			var extraRefs = new[]
+			{
+				typeof(System.Net.Http.HttpClient).Assembly,
+				typeof(System.Net.Sockets.Socket).Assembly,
+				typeof(System.Net.WebRequest).Assembly,
+			};
+			var refLocations = AppDomain.CurrentDomain.GetAssemblies()
 				.Where(asm => !asm.IsDynamic && !string.IsNullOrEmpty(asm.Location))
-				.Select(asm => MetadataReference.CreateFromFile(asm.Location))
-				.Concat(new[] { MetadataReference.CreateFromFile(Assembly.GetExecutingAssembly().Location) }).ToArray();
+				.Select(asm => asm.Location)
+				.Concat(extraRefs.Select(asm => asm.Location))
+				.Append(Assembly.GetExecutingAssembly().Location)
+				.Distinct(StringComparer.OrdinalIgnoreCase);
+			var param = refLocations
+				.Select(loc => MetadataReference.CreateFromFile(loc)).ToArray();
 
 			using var pluginFileStream = System.IO.File.OpenRead(File.FullName);
 			var sourceTree = CSharpSyntaxTree.ParseText(SourceText.From(pluginFileStream));
