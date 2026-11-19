@@ -66,6 +66,37 @@ namespace ChatBridge
 		private static readonly TimeSpan PublicSessionLifetime = TimeSpan.FromHours(6);
 		private static readonly TimeSpan PrivateSessionIdle = TimeSpan.FromHours(24);
 
+		// 会话重置时把本轮对话精炼成长期记忆。精炼只跑一次无工具的 one-shot 问答；
+		// 写库由插件直接调 mem.py（不经 ts3ab-mem），避免后台任务与主对话争用
+		// .speaker 单文件，把记忆写到别人的分区。
+		private const string MemPython = "/mystorage/ds_memory/.venv/bin/python";
+		private const string MemScript =
+			"/var/lib/ts3ab-codewhale/skills/memory-persistence/scripts/mem.py";
+		private const string MemDb = "/mystorage/ds_memory/ts3ab-bot/memory.db";
+		private static readonly TimeSpan DistillTimeout = TimeSpan.FromSeconds(120);
+		private static readonly TimeSpan MemWriteTimeout = TimeSpan.FromSeconds(120);
+		// 精炼只取最近若干轮并限长，避免长会话把一次请求撑爆。
+		private const int DistillMaxTurns = 30;
+		private const int DistillMaxChars = 12000;
+		private const int DistillMaxItems = 5;
+		// 轮次缓冲的防御上限：正常窗口内远达不到，只为防止异常情况下内存无界增长。
+		private const int TurnBufferLimit = 200;
+
+		// 精炼提示词：只输出条目正文，不调用工具、不编号，便于逐行解析。
+		private const string DistillPrompt =
+			"[记忆精炼] 你在整理一段 TeamSpeak 聊天记录。只提取值得长期记住的信息：" +
+			"用户稳定的偏好、身份或环境事实、明确约定、纠正，以及长期有效的指令。" +
+			"忽略一次性提问、闲聊、寒暄、泛泛常识和临时状态；不要写“用户说”这类转述，" +
+			"也不要总结整段对话。如果记录里用户明确说过不要记住、不要保存，跳过那部分。" +
+			"输出要求：每条一行，不超过 80 字，最多 5 条；" +
+			"不要编号、项目符号、代码块、引号或任何解释；没有值得记的就只输出 NONE。\n\n" +
+			"[聊天记录]\n";
+
+		// 模型即使被要求“不要编号”，仍可能带列表前缀；解析时统一剥掉。
+		private static readonly Regex DistillListPrefix = new Regex(
+			@"^\s*(?:[-*•]|\d{1,2}[.、)])\s*",
+			RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
 		// 复用 rights.toml 的白名单：这个 right 不挂任何聊天命令，
 		// 只用来问权限系统“这个 uid 是否被授权”。
 		private const string TriggerRight = "cmd.chatbridge";
@@ -222,6 +253,8 @@ namespace ChatBridge
 		private readonly Player player;
 		private readonly RightsBag rightsBag;
 		private readonly SemaphoreSlim gate = new SemaphoreSlim(MaxConcurrent, MaxConcurrent);
+		// 精炼串行执行：不同会话同时到期时排队，避免并发打满模型与记忆库。
+		private readonly SemaphoreSlim distillGate = new SemaphoreSlim(1, 1);
 		private readonly ConcurrentDictionary<string, DateTime> lastRequest =
 			new ConcurrentDictionary<string, DateTime>();
 		// 会话表：key 为 "dm:<uid>"（私聊）或 "public"（频道与服务器消息共用的公共会话）。
@@ -403,6 +436,10 @@ namespace ChatBridge
 
 						if (Interlocked.Increment(ref runCounter) % 20 == 0)
 							PruneSessions();
+
+						// 只把成功的一轮记进缓冲区；重置时据此精炼。
+						if (!string.IsNullOrWhiteSpace(answer))
+							RecordTurn(session, who, message.InvokerName, prompt, answer);
 
 						if (string.IsNullOrWhiteSpace(answer))
 							answer = "这次没拿到有效回答。";
@@ -1181,11 +1218,19 @@ namespace ChatBridge
 				}
 
 				Log.Info("ChatBridge: 会话 {0} 已不存在，改为新建", resumeId);
+				List<TurnRecord>? lostTurns = null;
 				lock (session)
 				{
 					if (session.Id == resumeId)
+					{
+						// 会话文件被清理或 codewhale 重启，旧上下文已丢失；
+						// 先把缓冲区里的问答精炼掉，再换新会话。
+						lostTurns = DetachTurnsLocked(session);
 						session.Id = null;
+					}
 				}
+				if (lostTurns != null)
+					QueueDistillation(session.Key, lostTurns);
 			}
 
 			var fresh = await Execute(null, BuildPrompt(speaker, question, isPublic, withPolicy: true))
@@ -1319,7 +1364,9 @@ namespace ChatBridge
 		private ChatSession GetSession(string key, bool isPublic)
 		{
 			var now = DateTime.UtcNow;
-			var session = sessions.GetOrAdd(key, _ => new ChatSession { IsPublic = isPublic });
+			var session = sessions.GetOrAdd(key,
+				k => new ChatSession { IsPublic = isPublic, Key = k });
+			List<TurnRecord>? expiredTurns = null;
 			lock (session)
 			{
 				if (session.Id != null)
@@ -1332,11 +1379,16 @@ namespace ChatBridge
 						Log.Info("ChatBridge: 会话 {0} 到期重置（{1}，起于 {2:HH:mm:ss}）", key,
 							isPublic ? "公共会话 6 小时" : "私聊空闲 24 小时",
 							isPublic ? session.StartedUtc.ToLocalTime() : session.LastUsedUtc.ToLocalTime());
+						// 在锁内只做摘取，精炼与写库放到锁外、后台执行，
+						// 不拖慢触发重置的这条新消息。
+						expiredTurns = DetachTurnsLocked(session);
 						session.Id = null;
 					}
 				}
 				session.LastUsedUtc = now;
 			}
+			if (expiredTurns != null)
+				QueueDistillation(key, expiredTurns);
 			return session;
 		}
 
@@ -1356,13 +1408,287 @@ namespace ChatBridge
 			}
 		}
 
+		/// <summary>记下成功的一轮问答，等会话重置时一并精炼。</summary>
+		private static void RecordTurn(ChatSession session, string uid, string name,
+			string question, string answer)
+		{
+			lock (session)
+			{
+				session.Turns.Add(new TurnRecord
+				{
+					Uid = uid,
+					Name = name,
+					Question = question,
+					Answer = answer,
+				});
+				if (session.Turns.Count > TurnBufferLimit)
+					session.Turns.RemoveRange(0, session.Turns.Count - TurnBufferLimit);
+			}
+		}
+
+		/// <summary>把待精炼轮次摘走（调用方持有 session 锁）。</summary>
+		private static List<TurnRecord> DetachTurnsLocked(ChatSession session)
+		{
+			var copy = new List<TurnRecord>(session.Turns);
+			session.Turns.Clear();
+			return copy;
+		}
+
+		/// <summary>后台精炼并写库。不占用对话闸门，也不阻塞触发重置的消息。</summary>
+		private void QueueDistillation(string sessionKey, List<TurnRecord> turns)
+		{
+			if (turns.Count == 0)
+				return;
+
+			_ = Task.Run(async () =>
+			{
+				await distillGate.WaitAsync().ConfigureAwait(false);
+				try
+				{
+					await DistillAndStore(sessionKey, turns).ConfigureAwait(false);
+				}
+				catch (Exception ex)
+				{
+					Log.Warn(ex, "ChatBridge: 会话 {0} 的记忆精炼任务失败", sessionKey);
+				}
+				finally
+				{
+					distillGate.Release();
+				}
+			});
+		}
+
+		/// <summary>插件停用前把所有会话里尚未精炼的轮次排入后台。</summary>
+		private void FlushPendingTurns()
+		{
+			foreach (var pair in sessions)
+			{
+				List<TurnRecord> turns;
+				lock (pair.Value)
+					turns = DetachTurnsLocked(pair.Value);
+				if (turns.Count > 0)
+					QueueDistillation(pair.Key, turns);
+			}
+		}
+
+		/// <summary>
+		/// 按发言者分组精炼：公共会话里多人共用一条会话，记忆只能落到各自的
+		/// chat:&lt;uid8&gt; 分区。发言者过多时只处理轮数最多的前 8 个，避免一次
+		/// 重置打出几十个模型请求。
+		/// </summary>
+		private async Task DistillAndStore(string sessionKey, List<TurnRecord> turns)
+		{
+			var groups = new Dictionary<string, List<TurnRecord>>(StringComparer.Ordinal);
+			foreach (var turn in turns)
+			{
+				if (string.IsNullOrWhiteSpace(turn.Uid))
+					continue;
+				if (!groups.TryGetValue(turn.Uid, out var list))
+					groups[turn.Uid] = list = new List<TurnRecord>();
+				list.Add(turn);
+			}
+
+			var ordered = new List<KeyValuePair<string, List<TurnRecord>>>(groups);
+			ordered.Sort((a, b) => b.Value.Count.CompareTo(a.Value.Count));
+			if (ordered.Count > 8)
+			{
+				Log.Warn("ChatBridge: 会话 {0} 有 {1} 位发言者，本次只精炼轮数最多的 8 位",
+					sessionKey, ordered.Count);
+				ordered.RemoveRange(8, ordered.Count - 8);
+			}
+
+			foreach (var pair in ordered)
+			{
+				var uid = pair.Key;
+				var uidShort = uid.Length <= 4 ? uid : uid.Substring(0, 4);
+				try
+				{
+					var transcript = BuildTranscript(pair.Value);
+					if (transcript.Length == 0)
+						continue;
+
+					var lines = await Distill(transcript).ConfigureAwait(false);
+					var stored = 0;
+					foreach (var line in lines)
+					{
+						if (await StoreMemory(uid, line).ConfigureAwait(false))
+							stored++;
+					}
+					Log.Info("ChatBridge: 会话 {0} 重置，uid {1}.. 精炼 {2} 条，写入 {3} 条",
+						sessionKey, uidShort, lines.Count, stored);
+				}
+				catch (Exception ex)
+				{
+					Log.Warn(ex, "ChatBridge: 会话 {0} 的精炼失败（uid {1}..）", sessionKey, uidShort);
+				}
+			}
+		}
+
+		/// <summary>取最近若干轮拼成精炼输入，总长受限。</summary>
+		private static string BuildTranscript(List<TurnRecord> turns)
+		{
+			var sb = new StringBuilder();
+			var start = Math.Max(0, turns.Count - DistillMaxTurns);
+			for (var i = start; i < turns.Count; i++)
+			{
+				sb.Append("Q: ").Append(turns[i].Question).Append('\n');
+				sb.Append("A: ").Append(turns[i].Answer).Append('\n');
+				if (sb.Length >= DistillMaxChars)
+					break;
+			}
+			if (sb.Length > DistillMaxChars)
+			{
+				var cut = DistillMaxChars;
+				// 不把代理对切成两半，否则 JSON/模型输入会出现孤立码元。
+				if (char.IsHighSurrogate(sb[cut - 1]))
+					cut--;
+				sb.Length = cut;
+			}
+			return sb.ToString();
+		}
+
+		/// <summary>跑一次无工具的 one-shot 精炼，结果不落 codewhale 会话文件。</summary>
+		private async Task<List<string>> Distill(string transcript)
+		{
+			var prompt = DistillPrompt + transcript;
+			var args = new List<string> { CodewhalePath, "exec", "--", prompt };
+			var result = await RunProcess(SandboxPath, args, DistillTimeout).ConfigureAwait(false);
+			if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.Stdout))
+			{
+				if (!string.IsNullOrWhiteSpace(result.Stderr))
+					Log.Warn("ChatBridge: 记忆精炼调用失败（exit {0}）：{1}",
+						result.ExitCode, Truncate(result.Stderr.Trim(), 300));
+				return new List<string>();
+			}
+			return ParseDistilledLines(result.Stdout);
+		}
+
+		/// <summary>宽容解析模型输出：剥列表前缀、去引号，最多保留 DistillMaxItems 条。</summary>
+		private static List<string> ParseDistilledLines(string raw)
+		{
+			var lines = new List<string>();
+			foreach (var rawLine in raw.Replace("\r\n", "\n").Split('\n'))
+			{
+				var line = DistillListPrefix.Replace(rawLine.Trim(), string.Empty).Trim();
+				line = line.Trim('"', '\'', '`', '“', '”', '「', '」').Trim();
+				if (line.Length == 0)
+					continue;
+				if (line.Equals("NONE", StringComparison.OrdinalIgnoreCase)
+					|| line == "无" || line == "没有" || line == "没有值得记住的内容")
+					continue;
+				if (line.Length > 200)
+					line = line.Substring(0, 200);
+				lines.Add(line);
+				if (lines.Count >= DistillMaxItems)
+					break;
+			}
+			return lines;
+		}
+
+		/// <summary>直接调 mem.py 写库（不经 ts3ab-mem，避免 .speaker 竞态）。</summary>
+		private async Task<bool> StoreMemory(string uid, string content)
+		{
+			var project = "chat:" + (uid.Length <= 8 ? uid : uid.Substring(0, 8));
+			var args = new List<string>
+			{
+				MemScript,
+				"--db", MemDb,
+				"--scope-uid", uid,
+				"add",
+				"-c", content,
+				"-p", project,
+				"-k", "note",
+				"--tags", "auto-distill",
+				"--source", "chatbridge-distill",
+				"--status", "confirmed",
+			};
+			var result = await RunProcess(MemPython, args, MemWriteTimeout).ConfigureAwait(false);
+			if (result.ExitCode != 0)
+			{
+				Log.Warn("ChatBridge: 写入记忆失败（exit {0}）：{1}",
+					result.ExitCode, Truncate(result.Stderr.Trim(), 300));
+				return false;
+			}
+			return true;
+		}
+
+		private sealed class ProcessResult
+		{
+			public int ExitCode;
+			public string Stdout = string.Empty;
+			public string Stderr = string.Empty;
+		}
+
+		/// <summary>跑一个外部进程并限时；超时即杀掉，不阻塞调用方。</summary>
+		private static async Task<ProcessResult> RunProcess(
+			string file, IReadOnlyList<string> args, TimeSpan timeout)
+		{
+			var psi = new ProcessStartInfo(file)
+			{
+				RedirectStandardInput = true,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				UseShellExecute = false,
+				CreateNoWindow = true,
+				StandardOutputEncoding = Encoding.UTF8,
+				StandardErrorEncoding = Encoding.UTF8,
+			};
+			foreach (var arg in args)
+				psi.ArgumentList.Add(arg);
+
+			try
+			{
+				using var proc = new Process { StartInfo = psi };
+				if (!proc.Start())
+					return new ProcessResult { ExitCode = -1, Stderr = "无法启动进程" };
+
+				// 提示词全部走参数，不需要 stdin；关闭它，避免子进程误等输入。
+				proc.StandardInput.Close();
+				var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+				var stderrTask = proc.StandardError.ReadToEndAsync();
+				var exitTask = WaitForExitAsync(proc);
+
+				var finished = await Task.WhenAny(exitTask, Task.Delay(timeout)).ConfigureAwait(false);
+				if (finished != exitTask)
+				{
+					try { proc.Kill(); } catch { /* 已退出 */ }
+					// 等管道收尾，避免读取任务在 using 释放后异常。
+					await Task.WhenAny(exitTask, Task.Delay(TimeSpan.FromSeconds(2))).ConfigureAwait(false);
+					return new ProcessResult { ExitCode = -1, Stderr = "超时" };
+				}
+
+				return new ProcessResult
+				{
+					ExitCode = proc.ExitCode,
+					Stdout = await SafeResult(stdoutTask).ConfigureAwait(false),
+					Stderr = await SafeResult(stderrTask).ConfigureAwait(false),
+				};
+			}
+			catch (Exception ex)
+			{
+				return new ProcessResult { ExitCode = -1, Stderr = ex.Message };
+			}
+		}
+
 		private sealed class ChatSession
 		{
 			public string? Id;
+			/// <summary>会话表里的 key（dm:&lt;uid&gt; 或 public），精炼日志与写库分区用。</summary>
+			public string Key = string.Empty;
 			/// <summary>当前会话建立成功（拿到 session id）的时刻，公共会话 6 小时窗口的起点。</summary>
 			public DateTime StartedUtc;
 			public DateTime LastUsedUtc;
 			public bool IsPublic;
+			/// <summary>本轮会话尚未精炼的问答。重置时整体摘走，避免重复写入。</summary>
+			public readonly List<TurnRecord> Turns = new List<TurnRecord>();
+		}
+
+		private sealed class TurnRecord
+		{
+			public string Uid = string.Empty;
+			public string Name = string.Empty;
+			public string Question = string.Empty;
+			public string Answer = string.Empty;
 		}
 
 		private static Task<string> SafeResult(Task<string> t)
@@ -1543,6 +1869,7 @@ namespace ChatBridge
 				foreach (var pair in sessions)
 				{
 					bool expired;
+					List<TurnRecord>? turns = null;
 					lock (pair.Value)
 					{
 						expired = pair.Value.Id == null
@@ -1550,9 +1877,13 @@ namespace ChatBridge
 							: pair.Value.IsPublic
 								? now - pair.Value.StartedUtc >= PublicSessionLifetime
 								: now - pair.Value.LastUsedUtc >= PrivateSessionIdle;
+						if (expired)
+							turns = DetachTurnsLocked(pair.Value);
 					}
-					if (expired)
-						sessions.TryRemove(pair.Key, out _);
+					if (!expired)
+						continue;
+					if (sessions.TryRemove(pair.Key, out _) && turns != null)
+						QueueDistillation(pair.Key, turns);
 				}
 			}
 			catch (Exception ex)
@@ -1566,6 +1897,9 @@ namespace ChatBridge
 
 		public void Dispose()
 		{
+			// 插件停用/热重载前尽力把未精炼的轮次冲出去；进程直接退出时可能来不及，
+			// 属于 best-effort，不影响主流程。
+			FlushPendingTurns();
 			StopControlChannel();
 			ts3.OnMessageReceived -= OnMessageReceived;
 			try { commands.UnregisterCollection(rightsBag); }
