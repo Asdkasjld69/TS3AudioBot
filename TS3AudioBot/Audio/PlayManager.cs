@@ -10,6 +10,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using TS3AudioBot.Config;
 using TS3AudioBot.Environment;
@@ -34,6 +35,13 @@ namespace TS3AudioBot.Audio
 
 		public PlayInfoEventArgs? CurrentPlayData { get; private set; }
 		public bool IsPlaying => CurrentPlayData != null;
+
+		/// <summary>How many seconds before the song end the next loop iteration gets preloaded.</summary>
+		private const double PreloadLeadSeconds = 5;
+		private static readonly TimeSpan PreloadCheckInterval = TimeSpan.FromMilliseconds(250);
+		private readonly object preloadLock = new object();
+		private Timer? preloadTimer;
+		private bool preloadTriggered;
 
 		public event AsyncEventHandler<PlayInfoEventArgs>? OnResourceUpdated;
 		public event AsyncEventHandler<PlayInfoEventArgs>? BeforeResourceStarted;
@@ -154,7 +162,6 @@ namespace TS3AudioBot.Audio
 		/// <summary>Plays the passed <see cref="PlayResource"/></summary>
 		/// <param name="invoker">The invoker of this resource. Used for responses and association.</param>
 		/// <param name="play">The associated resource type string to a factory.</param>
-		/// <param name="meta">Allows overriding certain settings for the resource.</param>
 		/// <returns>Ok if successful, or an error message otherwise.</returns>
 		public Task Play(InvokerData invoker, PlayResource play)
 		{
@@ -163,6 +170,98 @@ namespace TS3AudioBot.Audio
 			playlistManager.Index = 0;
 			stats.TrackSongLoad(play.AudioResource.AudioType, true, true);
 			return StartResource(invoker, play);
+		}
+
+		/// <summary>
+		/// Seamlessly switches to the preloaded source when the current song ended and we are in
+		/// single-song loop mode. Returns true when the switch happened (gapless loop), false when
+		/// the regular stop/restart path should be used instead.
+		/// </summary>
+		private async Task<bool> TrySeamlessLoop()
+		{
+			if (playlistManager.Loop != LoopMode.One)
+				return false;
+			var data = CurrentPlayData;
+			if (data is null)
+				return false;
+
+			// The switch itself is synchronous and instant; the events keep the same
+			// order as the regular start path (Before -> After) for listeners.
+			if (!playerConnection.TryActivatePreloaded())
+				return false;
+
+			playerConnection.Volume = Tools.Clamp(playerConnection.Volume, confBot.Audio.Volume.Min, confBot.Audio.Volume.Max);
+			await BeforeResourceStarted.InvokeAsync(this, data);
+			await AfterResourceStarted.InvokeAsync(this, data);
+			// Re-arm the monitor for the next loop iteration.
+			StartPreloadMonitor();
+			Log.Debug("Seamless loop switch done: {0}", data.ResourceData);
+			return true;
+		}
+
+		private void StartPreloadMonitor()
+		{
+			lock (preloadLock)
+			{
+				preloadTriggered = false;
+				preloadTimer?.Dispose();
+				preloadTimer = new Timer(_ =>
+				{
+					// All playback state is serialized on the player scheduler, so route the
+					// check through it to avoid races with the song-end switch.
+					_ = playerConnection.Scheduler.InvokeAsync(CheckPreloadAsync);
+				}, null, TimeSpan.FromSeconds(1), PreloadCheckInterval);
+			}
+		}
+
+		private void StopPreloadMonitor()
+		{
+			lock (preloadLock)
+			{
+				preloadTimer?.Dispose();
+				preloadTimer = null;
+				preloadTriggered = false;
+			}
+		}
+
+		private async Task CheckPreloadAsync()
+		{
+			lock (preloadLock)
+			{
+				if (preloadTriggered)
+					return;
+			}
+
+			if (playlistManager.Loop != LoopMode.One)
+				return;
+
+			var length = playerConnection.Length;
+			var position = playerConnection.Position;
+			if (!length.HasValue || !position.HasValue)
+				return; // Streams without a known duration (live/icy) can't be preloaded
+			if (length.Value - position.Value > TimeSpan.FromSeconds(PreloadLeadSeconds))
+				return;
+
+			lock (preloadLock)
+			{
+				if (preloadTriggered)
+					return;
+				preloadTriggered = true;
+			}
+
+			try
+			{
+				var pli = playlistManager.Current;
+				if (pli?.AudioResource is null)
+					return;
+				var play = await resourceResolver.Load(pli.AudioResource);
+				playerConnection.Preload(play.MergeMeta(pli.PlayInfo));
+				Log.Debug("Preloaded for seamless loop: {0}", play.AudioResource);
+			}
+			catch (Exception ex)
+			{
+				Log.Warn("Preload failed, falling back to regular loop restart: {0}", ex.Message);
+			}
 		}
 
 		private async Task StartResource(InvokerData invoker, PlaylistItem item)
@@ -201,6 +300,7 @@ namespace TS3AudioBot.Audio
 			playerConnection.Volume = Tools.Clamp(playerConnection.Volume, confBot.Audio.Volume.Min, confBot.Audio.Volume.Max);
 			CurrentPlayData = playInfo; // TODO meta as readonly
 			await AfterResourceStarted.InvokeAsync(this, playInfo);
+			StartPreloadMonitor();
 		}
 
 		private async Task StartCurrent(InvokerData invoker, bool manually = true)
@@ -269,6 +369,9 @@ namespace TS3AudioBot.Audio
 
 			if (songEndedByCallback)
 			{
+				if (await TrySeamlessLoop())
+					return;
+
 				try
 				{
 					await Next(CurrentPlayData?.Invoker ?? InvokerData.Anonymous, false);
@@ -281,6 +384,7 @@ namespace TS3AudioBot.Audio
 				playerConnection.Stop();
 			}
 
+			StopPreloadMonitor();
 			CurrentPlayData = null;
 			PlaybackStopped?.Invoke(this, EventArgs.Empty);
 		}

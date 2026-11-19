@@ -8,6 +8,7 @@
 // program. If not, see <https://opensource.org/licenses/OSL-3.0>.
 
 using System;
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
@@ -29,12 +30,14 @@ namespace TS3AudioBot.Audio
 		private readonly Id id;
 		private static readonly Regex FindDurationMatch = new Regex(@"^\s*Duration: (\d+):(\d\d):(\d\d).(\d\d)", Util.DefaultRegexConfig);
 		private static readonly Regex IcyMetadataMacher = new Regex("((\\w+)='(.*?)';\\s*)+", Util.DefaultRegexConfig);
-		private const string PreLinkConf = "-hide_banner -nostats -threads 1 -i \"";
+		private const string PreLinkConf = "-hide_banner -nostats -threads 1";
+		private const string InputLinkConf = "-i \"";
 		private const string PostLinkConf = "\" -ac 2 -ar 48000 -f s16le -acodec pcm_s16le pipe:1";
 		private const string LinkConfIcy = "-hide_banner -nostats -threads 1 -i pipe:0 -ac 2 -ar 48000 -f s16le -acodec pcm_s16le pipe:1";
 		private static readonly TimeSpan retryOnDropBeforeEnd = TimeSpan.FromSeconds(10);
 
 		private readonly ConfToolsFfmpeg config;
+		private readonly ConfAudio audioConfig;
 
 		public event EventHandler? OnSongEnd;
 		public event EventHandler<SongInfoChanged>? OnSongUpdated;
@@ -46,9 +49,10 @@ namespace TS3AudioBot.Audio
 		public int Channels { get; } = 2;
 		public int BitsPerSample { get; } = 16;
 
-		public FfmpegProducer(ConfToolsFfmpeg config, DedicatedTaskScheduler scheduler, Id id)
+		public FfmpegProducer(ConfToolsFfmpeg config, ConfAudio audioConfig, DedicatedTaskScheduler scheduler, Id id)
 		{
 			this.config = config;
+			this.audioConfig = audioConfig;
 			this.scheduler = scheduler;
 			this.id = id;
 		}
@@ -190,6 +194,16 @@ namespace TS3AudioBot.Audio
 			return StartFfmpegProcess(lastLink, value);
 		}
 
+		/// <summary>Builds the ffmpeg argument prefix up to and including the input flag, injecting the
+		/// user configured extra input arguments (e.g. reconnect and buffer options for network streams).</summary>
+		private string BuildLinkConf()
+		{
+			var extra = config.ExtraInputArgs.Value;
+			if (string.IsNullOrWhiteSpace(extra))
+				return string.Concat(PreLinkConf, " ", InputLinkConf);
+			return string.Concat(PreLinkConf, " ", extra.Trim(), " ", InputLinkConf);
+		}
+
 		private R<FfmpegInstance, string> StartFfmpegProcess(string url, TimeSpan? offsetOpt)
 		{
 			StopFfmpegProcess();
@@ -200,11 +214,11 @@ namespace TS3AudioBot.Audio
 			if (offset > TimeSpan.Zero)
 			{
 				var seek = string.Format(CultureInfo.InvariantCulture, @"-ss {0:hh\:mm\:ss\.fff}", offset);
-				arguments = string.Concat(seek, " ", PreLinkConf, url, PostLinkConf, " ", seek);
+				arguments = string.Concat(seek, " ", BuildLinkConf(), url, PostLinkConf, " ", seek);
 			}
 			else
 			{
-				arguments = string.Concat(PreLinkConf, url, PostLinkConf);
+				arguments = string.Concat(BuildLinkConf(), url, PostLinkConf);
 			}
 
 			var newInstance = new FfmpegInstance(
@@ -236,13 +250,16 @@ namespace TS3AudioBot.Audio
 				}
 
 				var stream = await response.Content.ReadAsStreamAsync();
+				int.TryParse(response.Headers.GetSingle("icy-br"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var icyBitrate);
 				var newInstance = new FfmpegInstance(
 					url,
 					new PreciseAudioTimer(this),
 					stream,
-					metaint)
+					metaint,
+					icyBitrate)
 				{
-					OnMetaUpdated = e => OnSongUpdated?.Invoke(this, e)
+					OnMetaUpdated = e => OnSongUpdated?.Invoke(this, e),
+					IcyBufferChunkCapacity = GetIcyBufferChunkCapacity(icyBitrate),
 				};
 
 				new Thread(() => newInstance.ReadStreamLoop(id))
@@ -318,6 +335,20 @@ namespace TS3AudioBot.Audio
 				throw new Exception("Cannot read on own scheduler. Throwing to prevent deadlock");
 		}
 
+		private const int IcyChunkSize = 4096;
+		private const int DefaultIcyBitrateKbps = 128;
+
+		/// <summary>Queue capacity in chunks for the icy read-ahead buffer, derived from the configured seconds.</summary>
+		private int GetIcyBufferChunkCapacity(int icyBitrateKbps)
+		{
+			var seconds = audioConfig.IcyBufferSeconds.Value;
+			if (seconds <= 0)
+				return 1;
+			var bitrateKbps = icyBitrateKbps > 0 ? icyBitrateKbps : DefaultIcyBitrateKbps;
+			var targetBytes = seconds * bitrateKbps * 1000.0 / 8.0;
+			return Math.Max(1, (int)(targetBytes / IcyChunkSize));
+		}
+
 		public void Dispose()
 		{
 			StopFfmpegProcess();
@@ -335,18 +366,23 @@ namespace TS3AudioBot.Audio
 
 			public Stream? IcyStream { get; }
 			public int IcyMetaInt { get; }
+			/// <summary>Stream bitrate from the icy-br header, or 0 when unknown.</summary>
+			public int IcyBitrateKbps { get; }
+			/// <summary>Read-ahead queue capacity in chunks; 1 means no extra buffering.</summary>
+			public int IcyBufferChunkCapacity { get; set; } = 1;
 			public bool Closed { get; set; }
 
 			public Action<SongInfoChanged>? OnMetaUpdated;
 
-			public FfmpegInstance(string url, PreciseAudioTimer timer) : this(url, timer, null!, 0) { }
-			public FfmpegInstance(string url, PreciseAudioTimer timer, Stream icyStream, int icyMetaInt)
+			public FfmpegInstance(string url, PreciseAudioTimer timer) : this(url, timer, null!, 0, 0) { }
+			public FfmpegInstance(string url, PreciseAudioTimer timer, Stream icyStream, int icyMetaInt, int icyBitrateKbps)
 			{
 				FfmpegProcess = new Process();
 				ReconnectUrl = url;
 				AudioTimer = timer;
 				IcyStream = icyStream;
 				IcyMetaInt = icyMetaInt;
+				IcyBitrateKbps = icyBitrateKbps;
 
 				HasTriedToReconnect = false;
 			}
@@ -396,18 +432,91 @@ namespace TS3AudioBot.Audio
 				//}
 			}
 
+			/// <summary>Consecutive read/write errors tolerated before the stream is closed.</summary>
+			private const int MaxConsecutiveErrors = 50;
+			private static readonly TimeSpan ErrorCountResetWindow = TimeSpan.FromSeconds(30);
+
 			public void ReadStreamLoop(Id id)
 			{
 				if (IcyStream is null)
 					throw new InvalidOperationException("Instance is not an icy stream");
 
 				Tools.SetLogId(id.ToString());
-				const int IcyMaxMeta = 255 * 16;
-				const int ReadBufferSize = 4096;
 
+				// The network reader runs ahead of ffmpeg and queues its data, so short
+				// network hiccups are served from the queue instead of reaching playback.
+				var queue = new BlockingCollection<byte[]>(IcyBufferChunkCapacity);
+				var netReader = new Thread(() =>
+				{
+					try { ReadIcyNetworkLoop(queue); }
+					catch (Exception ex) { Log.Debug(ex, "Icy stream reader stopped"); }
+					finally { queue.CompleteAdding(); }
+				})
+				{
+					Name = $"IcyStreamNetReader[{id}]",
+					IsBackground = true,
+				};
+				netReader.Start();
+
+				var lastErrorTime = DateTime.MinValue;
 				int errorCount = 0;
-				var buffer = new byte[Math.Max(ReadBufferSize, IcyMaxMeta)];
+
+				try
+				{
+					foreach (var chunk in queue.GetConsumingEnumerable())
+					{
+						if (Closed)
+							break;
+
+						try
+						{
+							FfmpegProcess.StandardInput.BaseStream.Write(chunk, 0, chunk.Length);
+							errorCount = 0;
+						}
+						catch (Exception ex)
+						{
+							if (Closed)
+								break;
+
+							var now = DateTime.UtcNow;
+							if (now - lastErrorTime > ErrorCountResetWindow)
+								errorCount = 0;
+							lastErrorTime = now;
+
+							if (++errorCount >= MaxConsecutiveErrors)
+							{
+								Log.Error(ex, "Failed too many times trying to access ffmpeg. Closing stream.");
+								break;
+							}
+
+							if (ex is InvalidOperationException)
+							{
+								Log.Debug(ex, "Waiting for ffmpeg");
+								Thread.Sleep(100);
+							}
+							else
+							{
+								Log.Debug(ex, "Stream read/write error");
+							}
+						}
+					}
+				}
+				finally
+				{
+					if (!Closed)
+						Close();
+				}
+			}
+
+			/// <summary>Reads the icy stream, splits off the metadata blocks and enqueues the audio bytes.</summary>
+			private void ReadIcyNetworkLoop(BlockingCollection<byte[]> queue)
+			{
+				const int IcyMaxMeta = 255 * 16;
+				var buffer = new byte[Math.Max(IcyChunkSize, IcyMaxMeta)];
+				var stream = IcyStream!;
 				int readCount = 0;
+				int readErrorCount = 0;
+				var lastReadErrorTime = DateTime.MinValue;
 
 				while (!Closed)
 				{
@@ -415,36 +524,27 @@ namespace TS3AudioBot.Audio
 					{
 						while (readCount < IcyMetaInt)
 						{
-							int read = IcyStream.Read(buffer, 0, Math.Min(ReadBufferSize, IcyMetaInt - readCount));
+							int read = stream.Read(buffer, 0, Math.Min(IcyChunkSize, IcyMetaInt - readCount));
 							if (read == 0)
-							{
-								Close();
 								return;
-							}
 							readCount += read;
-							FfmpegProcess.StandardInput.BaseStream.Write(buffer, 0, read);
-							errorCount = 0;
+							if (!EnqueueChunk(queue, buffer, read))
+								return;
 						}
 						readCount = 0;
 
-						var metaByte = IcyStream.ReadByte();
+						int metaByte = stream.ReadByte();
 						if (metaByte < 0)
-						{
-							Close();
 							return;
-						}
 
 						if (metaByte > 0)
 						{
 							metaByte *= 16;
 							while (readCount < metaByte)
 							{
-								int read = IcyStream.Read(buffer, 0, metaByte - readCount);
+								int read = stream.Read(buffer, 0, metaByte - readCount);
 								if (read == 0)
-								{
-									Close();
 									return;
-								}
 								readCount += read;
 							}
 							readCount = 0;
@@ -456,25 +556,35 @@ namespace TS3AudioBot.Audio
 					}
 					catch (Exception ex)
 					{
-						errorCount++;
-						if (errorCount >= 50)
+						var now = DateTime.UtcNow;
+						if (now - lastReadErrorTime > ErrorCountResetWindow)
+							readErrorCount = 0;
+						lastReadErrorTime = now;
+
+						if (++readErrorCount >= MaxConsecutiveErrors)
 						{
-							Log.Error(ex, "Failed too many times trying to access ffmpeg. Closing stream.");
+							Log.Error(ex, "Failed too many times reading the icy stream. Closing stream.");
 							Close();
 							return;
 						}
 
-						if (ex is InvalidOperationException)
-						{
-							Log.Debug(ex, "Waiting for ffmpeg");
-							Thread.Sleep(100);
-						}
-						else
-						{
-							Log.Debug(ex, "Stream read/write error");
-						}
+						Log.Debug(ex, "Icy stream read error");
+						Thread.Sleep(100);
 					}
 				}
+			}
+
+			/// <summary>Copies and enqueues a chunk, aborting when the stream is closing.</summary>
+			private bool EnqueueChunk(BlockingCollection<byte[]> queue, byte[] buffer, int count)
+			{
+				var chunk = new byte[count];
+				Buffer.BlockCopy(buffer, 0, chunk, 0, count);
+				while (!Closed)
+				{
+					if (queue.TryAdd(chunk, 200))
+						return true;
+				}
+				return false;
 			}
 
 			private static SongInfoChanged ParseIcyMeta(string metaString)

@@ -23,8 +23,19 @@ namespace TS3AudioBot.Audio
 	{
 		private const Codec SendCodec = Codec.OpusMusic;
 		private readonly DedicatedTaskScheduler scheduler;
+		private readonly ConfToolsFfmpeg ffmpegConfig;
+		private readonly ConfAudio audioConfig;
+		private readonly Id id;
+		/// <summary>Protects all access to <see cref="standbyFfmpeg"/>.</summary>
+		private readonly object standbyLock = new object();
+		/// <summary>The pre-started ffmpeg instance waiting to be activated on the next loop iteration.</summary>
+		private FfmpegProducer? standbyFfmpeg;
 
 		public IPlayerSource? CurrentPlayerSource { get; private set; }
+		/// <summary>True if a pre-started source for the next loop iteration is ready.</summary>
+		public bool IsPreloaded { get { lock (standbyLock) return standbyFfmpeg != null; } }
+		/// <summary>The scheduler all playback events run on. Use it to serialize access to this instance.</summary>
+		public DedicatedTaskScheduler Scheduler => scheduler;
 		public StallCheckPipe StallCheckPipe { get; }
 		public VolumePipe VolumePipe { get; }
 		public FfmpegProducer FfmpegProducer { get; }
@@ -36,8 +47,11 @@ namespace TS3AudioBot.Audio
 		public Player(ConfRoot confRoot, ConfBot config, DedicatedTaskScheduler scheduler, Id id)
 		{
 			this.scheduler = scheduler;
+			this.id = id;
+			ffmpegConfig = confRoot.Tools.Ffmpeg;
+			audioConfig = config.Audio;
 
-			FfmpegProducer = new FfmpegProducer(confRoot.Tools.Ffmpeg, scheduler, id);
+			FfmpegProducer = new FfmpegProducer(ffmpegConfig, audioConfig, scheduler, id);
 			StallCheckPipe = new StallCheckPipe();
 			VolumePipe = new VolumePipe();
 			Volume = config.Audio.Volume.Default;
@@ -66,6 +80,7 @@ namespace TS3AudioBot.Audio
 
 		public async Task Play(PlayResource res)
 		{
+			DiscardStandby();
 			if (res is MediaPlayResource mres && mres.IsIcyStream)
 				await FfmpegProducer.AudioStartIcy(res.PlayUri);
 			else
@@ -73,7 +88,9 @@ namespace TS3AudioBot.Audio
 			Play(FfmpegProducer);
 		}
 
-		public void Play(IPlayerSource source)
+		public void Play(IPlayerSource source) => AttachSource(source);
+
+		private void AttachSource(IPlayerSource source)
 		{
 			var oldSource = CurrentPlayerSource;
 			if (oldSource != source)
@@ -92,6 +109,54 @@ namespace TS3AudioBot.Audio
 			TimePipe.Paused = false;
 		}
 
+		/// <summary>
+		/// Pre-starts the given resource in a standby ffmpeg instance without hooking it into the
+		/// playback pipeline yet. Its decoded output accumulates in the OS pipe buffer, so once
+		/// activated it can deliver audio immediately (gapless loop). Call on the scheduler thread.
+		/// </summary>
+		public void Preload(PlayResource res)
+		{
+			lock (standbyLock)
+			{
+				DiscardStandby();
+				if (res is MediaPlayResource mres && mres.IsIcyStream)
+					return; // Live streams have no known end and can't be preloaded
+
+				var standby = new FfmpegProducer(ffmpegConfig, audioConfig, scheduler, id);
+				_ = standby.AudioStart(res.PlayUri, res.PlayInfo?.StartOffset);
+				standbyFfmpeg = standby;
+			}
+		}
+
+		/// <summary>
+		/// Activates the preloaded standby source if one is ready. The old (ended) source is
+		/// removed and disposed and the standby becomes the new current source.
+		/// Returns false if no preloaded source is available.
+		/// </summary>
+		public bool TryActivatePreloaded()
+		{
+			FfmpegProducer? standby;
+			lock (standbyLock)
+			{
+				standby = standbyFfmpeg;
+				standbyFfmpeg = null;
+			}
+			if (standby is null)
+				return false;
+			AttachSource(standby);
+			return true;
+		}
+
+		private void DiscardStandby()
+		{
+			lock (standbyLock)
+			{
+				var standby = standbyFfmpeg;
+				standbyFfmpeg = null;
+				standby?.Dispose();
+			}
+		}
+
 		private void CleanSource(IPlayerSource? source)
 		{
 			if (source is null)
@@ -104,6 +169,7 @@ namespace TS3AudioBot.Audio
 
 		public void Stop()
 		{
+			DiscardStandby();
 			CurrentPlayerSource?.Dispose();
 			if (MergePipe.Count <= 1)
 				TimePipe.Paused = true;

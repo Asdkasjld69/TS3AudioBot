@@ -168,11 +168,22 @@ namespace TS3AudioBot
 			ts3client.OnWhisperNoTarget += (s, e) => player.SetStall();
 
 			commandManager.RegisterCollection(MainCommands.Bag);
-			// TODO remove after plugin rework
+			// Scan plugins directory and auto-start eligible plugins
 			var pluginManager = Injector.GetModuleOrThrow<PluginManager>();
+			pluginManager.GetPluginOverview(this);
 			foreach (var plugin in pluginManager.Plugins)
+			{
 				if (plugin.Type == PluginType.CorePlugin || plugin.Type == PluginType.Commands)
 					commandManager.RegisterCollection(plugin.CorePlugin.Bag);
+				else if (plugin.Type == PluginType.BotPlugin && plugin.CheckStatus(this) == PluginStatus.Ready)
+				{
+					var result = plugin.Start(this);
+					if (result != PluginResponse.Ok)
+						Log.Warn("Failed to auto-start BotPlugin \"{0}\": {1}", plugin.Name, result);
+					else
+						Log.Info("Auto-started BotPlugin \"{0}\"", plugin.Name);
+				}
+			}
 			// Restore all alias from the config
 			foreach (var alias in config.Commands.Alias.GetAllItems())
 				commandManager.RegisterAlias(alias.Key, alias.Value).UnwrapToLog(Log);

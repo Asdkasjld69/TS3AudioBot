@@ -82,6 +82,8 @@ namespace TS3AudioBot.Config
 	public class ConfToolsFfmpeg : ConfigTable
 	{
 		public ConfigValue<string> Path { get; } = new ConfigValue<string>("path", "ffmpeg");
+		public ConfigValue<string> ExtraInputArgs { get; } = new ConfigValue<string>("extra_input_args", "",
+			"Extra arguments inserted right before the ffmpeg input (-i). Useful for slow or unstable network streams, e.g. -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -buffer_size 2000000. Larger read-ahead buffers trade latency for stability; non-network inputs ignore them.");
 	}
 
 	public class ConfRights : ConfigTable
@@ -241,6 +243,10 @@ namespace TS3AudioBot.Config
 			" - whisper : Whispers to the channel where the request came from. Other users can join with '!subscribe'.\n" +
 			" - voice : Sends via normal voice to the current channel. '!subscribe' will not work in this mode.\n" +
 			" - !... : A custom command. Use '!xecute (!a) (!b)' for example to execute multiple commands.");
+		public ConfigValue<int> IcyBufferSeconds { get; } = new ConfigValue<int>("icy_buffer_seconds", 0,
+			"Extra read-ahead buffer in seconds for icy/radio network streams.\n" +
+			"0 disables it. A few seconds absorb short network hiccups that would otherwise\n" +
+			"cause dropouts; larger values add playback latency.");
 	}
 
 	public class ConfAudioVolume : ConfigTable
