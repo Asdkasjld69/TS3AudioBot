@@ -104,6 +104,8 @@ namespace ChatBridge
 		private const string PasswordRight = "cmd.chatbridge.password";
 		// 歌单写操作单独一个 right：改歌单是持久化副作用，比聊天重。
 		private const string PlaylistRight = "cmd.chatbridge.playlist";
+		// 代发私信单独一个 right：能聊天不等于能以 bot 的名义给别人发消息。
+		private const string SendRight = "cmd.chatbridge.send";
 
 		// 上传口令由匿名聊天站点每小时整点轮换写入，32 位小写十六进制。
 		// 分发起点在插件而不是模型：只有这里能“只发私信”，模型没有发私信的工具。
@@ -230,6 +232,18 @@ namespace ChatBridge
 		private static readonly Regex PlShow = new Regex(
 			@"^(?<name>\S+)\z", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+		// ── 代发私信 ──
+		// 形式：私信 <目标> <内容>
+		//   ＜目标＞ 可以是：
+		//     #431            当前 clientId（会随重连变，只适合即时使用）
+		//     uid:xxxx=        uid（跨重连稳定）
+		//     "名 字"          带空格的昵称，用双引号包起来
+		//     张三             不带空格的昵称
+		// 内容原样发出：不做转义、不做长度截断、不做任何内容过滤。
+		private static readonly Regex SendCommand = new Regex(
+			@"^\s*(?:私信|发消息|发送消息|msg|dm)(?:\s+(?<rest>[\s\S]*))?\z",
+			RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
 		// 可达性探测：只用于 http(s) 链接。
 		private static readonly HttpClient ProbeClient = new HttpClient
 		{
@@ -293,7 +307,7 @@ namespace ChatBridge
 			this.player = player ?? throw new ArgumentNullException(nameof(player));
 			this.playlistManager = playlistManager ?? throw new ArgumentNullException(nameof(playlistManager));
 			this.resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
-			rightsBag = new RightsBag(TriggerRight, PasswordRight, PlaylistRight);
+			rightsBag = new RightsBag(TriggerRight, PasswordRight, PlaylistRight, SendRight);
 		}
 
 		public void Initialize()
@@ -366,11 +380,23 @@ namespace ChatBridge
 
 				if (prompt.Length == 0)
 					return;
-				if (prompt.Length > MaxPromptChars)
-					prompt = prompt.Substring(0, MaxPromptChars);
 
 				var who = message.InvokerUid?.Value ?? message.InvokerId.ToString();
 				var now = DateTime.UtcNow;
+
+				// 代发私信必须排在截断之前：正文要原样发出，不能被 MaxPromptChars 切掉。
+				// 这条路径同样不调模型，且对正文不做任何转义或过滤。
+				var sendMatch = SendCommand.Match(prompt);
+				if (sendMatch.Success)
+				{
+					await HandleSendCommand(message, who,
+						sendMatch.Groups["rest"].Success ? sendMatch.Groups["rest"].Value : string.Empty)
+						.ConfigureAwait(false);
+					return;
+				}
+
+				if (prompt.Length > MaxPromptChars)
+					prompt = prompt.Substring(0, MaxPromptChars);
 
 				Log.Info("ChatBridge 命中@: {0} (uid {1}..) target={2} promptLen={3}",
 					message.InvokerName, who.Substring(0, Math.Min(4, who.Length)),
@@ -658,6 +684,105 @@ namespace ChatBridge
 				Log.Warn(ex, "ChatBridge: 私信发送失败");
 				return false;
 			}
+		}
+
+		// ── 代发私信 ───────────────────────────────────────────────
+		// 语法：私信 <目标> <内容>
+		// 内容严格按输入原文发送：不转义、不做长度截断、不做任何内容过滤。
+
+		private async Task HandleSendCommand(TextMessage message, string who, string rest)
+		{
+			var uid = who.Substring(0, Math.Min(4, who.Length));
+
+			if (!await HasRight(message, SendRight).ConfigureAwait(false))
+			{
+				Log.Info("ChatBridge 拒绝代发: uid {0}.. 没有 '{1}' 权限", uid, SendRight);
+				return;
+			}
+
+			if (!TryParseSend(rest, out var target, out var content))
+			{
+				await Reply(message, "用法：私信 <目标> <内容>\n" +
+					"目标可以是昵称、#clientId 或 uid:你的uid；带空格的昵称用双引号包起来。")
+					.ConfigureAwait(false);
+				return;
+			}
+
+			ClientList client;
+			try
+			{
+				client = await ResolveSendTarget(target).ConfigureAwait(false);
+			}
+			catch (Exception ex)
+			{
+				Log.Info("ChatBridge: 代发目标无法解析 [{0}]：{1}", target, ex.Message);
+				await Reply(message, "找不到目标 \"" + target + "\"。").ConfigureAwait(false);
+				return;
+			}
+
+			var sent = await SendPrivate(client.ClientId, content).ConfigureAwait(false);
+			Log.Info("ChatBridge: 代发私信 {0} -> {1} (uid {2}.., {3} 字)，结果={4}",
+				message.InvokerName, client.Name, uid, content.Length, sent ? "成功" : "失败");
+
+			// 私聊场景不用再发一遍确认，否则用户会收到两条。
+			if (message.Target != TextMessageTargetMode.Private)
+			{
+				await Reply(message, sent
+					? "已发给 " + client.Name + "。"
+					: "发送失败，请确认对方在线且允许接收私信。").ConfigureAwait(false);
+			}
+		}
+
+		/// <summary>
+		/// 拆出目标与正文。只切分一次，正文从分隔符之后开始原样保留，
+		/// 不做 Trim、不合并空白、不处理转义。
+		/// </summary>
+		private static bool TryParseSend(string rest, out string target, out string content)
+		{
+			target = string.Empty;
+			content = string.Empty;
+			if (string.IsNullOrEmpty(rest))
+				return false;
+
+			int pos;
+			if (rest[0] == '"')
+			{
+				var end = rest.IndexOf('"', 1);
+				if (end < 0)
+					return false;
+				target = rest.Substring(1, end - 1);
+				pos = end + 1;
+			}
+			else
+			{
+				var sep = rest.IndexOfAny(new[] { ' ', '\t' });
+				if (sep <= 0)
+					return false;
+				target = rest.Substring(0, sep);
+				pos = sep;
+			}
+
+			// 只吃掉一个分隔空白，后面全是正文。
+			if (pos < rest.Length && (rest[pos] == ' ' || rest[pos] == '\t'))
+				pos++;
+			content = rest.Substring(pos);
+
+			return target.Length > 0 && content.Length > 0;
+		}
+
+		private Task<ClientList> ResolveSendTarget(string target)
+		{
+			if (target.Length > 1 && target[0] == '#'
+				&& ushort.TryParse(target.AsSpan(1), out var rawId))
+			{
+				return ts3.GetFallbackedClientById(new ClientId(rawId));
+			}
+
+			const string uidPrefix = "uid:";
+			if (target.StartsWith(uidPrefix, StringComparison.OrdinalIgnoreCase))
+				return ts3.GetClientByUid(new Uid(target.Substring(uidPrefix.Length)));
+
+			return ts3.GetClientByName(target);
 		}
 
 		// ── 歌单写操作 ──────────────────────────────────────────────

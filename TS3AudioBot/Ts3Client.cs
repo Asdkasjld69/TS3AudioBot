@@ -272,6 +272,19 @@ namespace TS3AudioBot
 			return client;
 		}
 
+		/// <summary>
+		/// 按 uid 查找当前在线客户端。uid 跨重连稳定，适合作为长期标识；
+		/// clientId 每次重连都会变，不要用它做持久引用。
+		/// </summary>
+		public async Task<ClientList> GetClientByUid(Uid uid)
+		{
+			await RefreshClientBuffer(false);
+			var client = clientbuffer.Find(cb => cb.Uid is Uid u && u == uid);
+			if (client is null)
+				throw new CommandException(strings.error_ts_no_client_found);
+			return client;
+		}
+
 		private async Task<ClientList> ClientBufferRequest(Predicate<ClientList> pred)
 		{
 			await RefreshClientBuffer(false);
