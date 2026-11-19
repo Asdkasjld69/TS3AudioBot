@@ -476,8 +476,9 @@ namespace TS3AudioBot
 				{
 					using (setStream)
 					{
-						var result = await ts3FullClient.UploadAvatar(setStream);
-						result.UnwrapToLog(Log);
+						// 走 Ts3Client 包装：它会按服务器的 i_client_max_avatar_filesize
+						// 压缩封面并降级重试，避免封面过大导致 permission_invalid_size。
+						await ts3client.UploadAvatar(setStream);
 					}
 				}
 				catch (Exception ex)

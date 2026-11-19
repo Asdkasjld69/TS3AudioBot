@@ -8,6 +8,7 @@
 // program. If not, see <https://opensource.org/licenses/OSL-3.0>.
 
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -451,10 +452,145 @@ namespace TS3AudioBot
 			}
 		}
 
-		public Task UploadAvatar(System.IO.Stream stream)
-			=> ts3FullClient.UploadAvatar(stream).UnwrapThrow(e =>
-				(e == TsErrorCode.permission_invalid_size ? strings.error_ts_file_too_big : null, false)
-			);
+		// 服务器对头像大小有 i_client_max_avatar_filesize 限制，超出直接回
+		// permission_invalid_size。缓存一次查询结果，连接变化时清空。
+		private long? avatarMaxBytes;
+		private DateTime avatarMaxBytesAt = DateTime.MinValue;
+		// true 表示该值来自服务器 permoverview；false 表示查询失败后的兜底。
+		private bool avatarLimitKnown;
+
+		private async Task<long> GetAvatarMaxBytes()
+		{
+			// 限制值在会话期间基本不变，缓存 10 分钟，避免每首歌都多一次往返。
+			if (avatarMaxBytes.HasValue && DateTime.UtcNow - avatarMaxBytesAt < TimeSpan.FromMinutes(10))
+				return avatarMaxBytes.Value;
+
+			try
+			{
+				var infoResult = await ts3FullClient.ClientInfo(ts3FullClient.ClientId);
+				if (infoResult.Ok)
+				{
+					var perms = await ts3FullClient.PermOverview(
+						infoResult.Value.DatabaseId, infoResult.Value.ChannelId,
+						TsPermission.i_client_max_avatar_filesize);
+					if (!perms.Ok)
+						Log.Debug("permoverview 失败：{0}", perms.Error.ErrorFormat());
+					else if (perms.Value.Length == 0)
+						Log.Debug("permoverview 返回空（可能缺 b_client_permissionoverview_view）");
+					if (perms.Ok)
+					{
+						foreach (var p in perms.Value)
+						{
+							if (p.PermissionId == TsPermission.i_client_max_avatar_filesize)
+							{
+								var value = p.PermissionValue;
+								// 0 表示服务器未配置。按 TS3 客户端的常见上限兜底，
+								// 仍然会被压缩到很小，不至于一律失败。
+								var limit = value > 0 ? (long)value : 500_000L;
+								avatarMaxBytes = limit;
+								avatarMaxBytesAt = DateTime.UtcNow;
+								avatarLimitKnown = true;
+								Log.Info("头像大小上限：{0} 字节（服务器值 {1}）", limit, value);
+								return limit;
+							}
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Log.Warn(ex, "查询头像大小上限失败，按保守值处理");
+			}
+
+			// 查询失败：不假装知道上限。用一个"等于不限制"的值让调用方
+			// 先试原图，失败后再按压缩梯度降级。
+			avatarLimitKnown = false;
+			avatarMaxBytes = long.MaxValue;
+			avatarMaxBytesAt = DateTime.UtcNow;
+			Log.Debug("未取到头像大小上限，将按原图优先、失败降级处理");
+			return avatarMaxBytes.Value;
+		}
+
+		private static bool IsAvatarSizeError(CommandError error)
+		{
+			if (error.Id == TsErrorCode.permission_invalid_size)
+				return true;
+			var text = error.ErrorFormat();
+			return text.IndexOf("invalid size", StringComparison.OrdinalIgnoreCase) >= 0
+				|| text.IndexOf("permission_invalid_size", StringComparison.OrdinalIgnoreCase) >= 0;
+		}
+
+		/// <summary>
+		/// 上传头像。先按服务器限制压缩；若仍被拒（限制值与查询结果不一致，
+		/// 或服务器另有硬上限），逐级降级重试，直到成功或梯度用尽。
+		/// </summary>
+		public async Task UploadAvatar(System.IO.Stream stream)
+		{
+			byte[] raw;
+			using (var mem = new MemoryStream())
+			{
+				// 不能用 ConfigureAwait(false)：TS3 命令必须在 DedicatedTaskScheduler 线程上发出
+				await stream.CopyToAsync(mem);
+				raw = mem.ToArray();
+			}
+			if (raw.Length == 0)
+				throw new CommandException(strings.error_ts_file_too_big, CommandExceptionReason.CommandError);
+
+			var limit = await GetAvatarMaxBytes();
+
+			// 小图（思考态提示图那种几百字节）不重编码，重编码反而变大变糊。
+			// 大图直接走压缩梯度——服务器上限通常远小于它，先试原图只会
+			// 白搭一次几百 KB 的失败传输。
+			const int skipCompressBelow = 32 * 1024;
+			var candidates = new List<byte[]>();
+			if (raw.Length <= skipCompressBelow && raw.Length <= limit)
+			{
+				candidates.Add(raw);
+			}
+			else
+			{
+				foreach (var c in ImageUtil.CompressToFit(raw, avatarLimitKnown ? limit : 0))
+				{
+					if (c.Length < raw.Length)
+						candidates.Add(c);
+				}
+			}
+
+			if (candidates.Count == 0)
+				candidates.Add(raw); // 未知格式：保持旧行为，直接试原图
+
+			CommandError? lastError = null;
+			for (int i = 0; i < candidates.Count; i++)
+			{
+				var candidate = candidates[i];
+				using var ms = new MemoryStream(candidate, writable: false);
+				var result = await ts3FullClient.UploadAvatar(ms);
+				if (result.Ok)
+				{
+					if (candidate.Length != raw.Length)
+						Log.Info("头像已压缩上传：{0} → {1} 字节（第 {2}/{3} 档，上限 {4}）",
+							raw.Length, candidate.Length, i + 1, candidates.Count,
+							avatarLimitKnown ? limit.ToString() : "未知");
+					return;
+				}
+
+				lastError = result.Error;
+				Log.Warn("头像上传被拒（第 {0}/{1} 档，{2} 字节）：{3}",
+					i + 1, candidates.Count, candidate.Length, result.Error.ErrorFormat());
+				// 只有"大小不合法"才值得降级重试；其它错误重试也没用。
+				// 注意 TSLib 把底层错误包成了 custom_error，Id 不再是
+				// permission_invalid_size，所以必须连消息一起判断。
+				if (!IsAvatarSizeError(result.Error))
+					break;
+			}
+
+			var message = lastError is null
+				? strings.error_ts_file_too_big.ToString()
+				: lastError.ErrorFormat();
+			throw new TeamSpeakErrorCommandException(
+				message,
+				lastError ?? CommandError.Custom("avatar upload failed"));
+		}
 
 		public Task DeleteAvatar() => ts3FullClient.DeleteAvatar().UnwrapThrow();
 

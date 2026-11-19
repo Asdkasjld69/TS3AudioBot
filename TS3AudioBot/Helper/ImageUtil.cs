@@ -13,6 +13,7 @@ using SixLabors.ImageSharp.Formats.Gif;
 using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.Processing;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 
@@ -79,6 +80,77 @@ namespace TS3AudioBot.Helper
 			mem.Seek(0, SeekOrigin.Begin);
 			return new ImageHolder(mem, mime);
 		}
+
+	/// <summary>
+	/// 按目标字节上限压缩图片，返回从"质量最好"到"最能塞下"的降级序列。
+	/// TS3 服务端用 i_client_max_avatar_filesize 卡头像大小，超了会回
+	/// permission_invalid_size；调用方拿这个序列逐个上传，第一个成功即止。
+	/// 320px/75 质量的封面常有 20-40KB，而服务器允许值可能只有几 KB。
+	/// </summary>
+	private static List<byte[]> CompressToFitImpl(byte[] source, long maxBytes)
+	{
+		var result = new List<byte[]>();
+		if (source == null || source.Length == 0)
+			return result;
+
+		bool animated;
+		try
+		{
+			using var probe = Image.Load(source);
+			animated = probe.Frames.Count > 1;
+		}
+		catch (ImageFormatException)
+		{
+			return result;
+		}
+
+		// 宽 × 质量 的降级梯度。前面保清晰度，后面快速缩小。
+		var widths = new[] { 320, 240, 180, 128, 96, 64 };
+		var qualities = animated ? new[] { 0 } : new[] { 75, 60, 45 };
+
+		foreach (var width in widths)
+		{
+			foreach (var quality in qualities)
+			{
+				byte[] encoded;
+				try
+				{
+					using var img = Image.Load(source);
+					if (img.Width > width)
+					{
+						float ratio = img.Width / (float)img.Height;
+						var h = Math.Max(1, (int)(width / ratio));
+						img.Mutate(x => x.Resize(width, h));
+					}
+
+					using var ms = new MemoryStream();
+					if (animated)
+						img.Save(ms, GifFormat.Instance);
+					else
+						img.Save(ms, new JpegEncoder { Quality = quality });
+
+					encoded = ms.ToArray();
+				}
+				catch (Exception ex)
+				{
+					Log.Debug(ex, "CompressToFit: 编码失败（{0}px/q{1}）", width, quality);
+					continue;
+				}
+
+				if (result.Count > 0 && result[result.Count - 1].Length == encoded.Length)
+					continue;
+				result.Add(encoded);
+
+				if (maxBytes > 0 && encoded.Length <= maxBytes)
+					return result;
+			}
+		}
+
+		return result;
+	}
+
+	public static List<byte[]> CompressToFit(byte[] source, long maxBytes)
+		=> CompressToFitImpl(source, maxBytes);
 	}
 
 	class ImageHolder : IDisposable
