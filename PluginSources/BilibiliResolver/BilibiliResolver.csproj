@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- 只为编译期校验与产出 dll。运行时也可以直接把 BilibiliResolverPlugin.cs
+       放进 TS3AudioBot 的 plugins 目录，由内置 Roslyn 现场编译。 -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>8.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>BilibiliResolverPlugin</AssemblyName>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <BinDir Condition="'$(BinDir)' == ''">$(MSBuildThisFileDirectory)../../TS3AudioBot/bin/Release/netcoreapp3.1</BinDir>
+    <NoWarn>$(NoWarn);CS1701;CS1702;CS8632;NU1701</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="BilibiliResolverPlugin.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="TS3AudioBot">
+      <HintPath>$(BinDir)/TS3AudioBot.dll</HintPath>
+    </Reference>
+    <Reference Include="TSLib">
+      <HintPath>$(BinDir)/TSLib.dll</HintPath>
+    </Reference>
+    <Reference Include="NLog">
+      <HintPath>$(BinDir)/NLog.dll</HintPath>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(BinDir)/Newtonsoft.Json.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
