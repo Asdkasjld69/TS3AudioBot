@@ -273,16 +273,16 @@ namespace TS3AudioBot
 		}
 
 		/// <summary>
-		/// 按 uid 查找当前在线客户端。uid 跨重连稳定，适合作为长期标识；
-		/// clientId 每次重连都会变，不要用它做持久引用。
+		/// 按 uid 查当前在线客户端。走 clientgetids，只靠 clientinfo 级别的权限，
+		/// 不需要 b_virtualserver_client_list；后者常常没授予 bot 身份。
+		/// 返回的每一项同时带 clientId 与昵称。
 		/// </summary>
-		public async Task<ClientList> GetClientByUid(Uid uid)
+		public async Task<ClientIds[]> GetClientIdsByUid(Uid uid)
 		{
-			await RefreshClientBuffer(false);
-			var client = clientbuffer.Find(cb => cb.Uid is Uid u && u == uid);
-			if (client is null)
+			var result = await ts3FullClient.GetClientIds(uid).ConfigureAwait(false);
+			if (!result)
 				throw new CommandException(strings.error_ts_no_client_found);
-			return client;
+			return result.Value;
 		}
 
 		private async Task<ClientList> ClientBufferRequest(Predicate<ClientList> pred)

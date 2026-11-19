@@ -142,7 +142,10 @@ namespace ChatBridge
 			"用户要求新增技能时，可加载 skill-creator 技能，把新技能建在 " + SkillsDir + " 下；" +
 			"那里内置的技能是只读的，不要试图修改它们。" +
 			"不要罗列目录清单、目录结构或绝对路径，只引用必要的文件名或行号。" +
-			"不要粘贴整段文件内容、大段代码或命令输出原文。";
+			"不要粘贴整段文件内容、大段代码或命令输出原文。" +
+			"控制 bot 用 ts3ab-ctl：播放用 play/queue/pause/stop 等；" +
+			"需要给指定用户发私信时用 ts3ab-ctl send <目标> <内容>，" +
+			"目标是昵称、#clientId 或 uid:；正文要逐字保留就用 send <目标> - 从 stdin 传入。";
 
 		// 私聊：一个 uid 一条会话，可以回答得完整一些。
 		// 记忆分区由 ts3ab-mem 按 .speaker 自动注入，模型不需要管分区名。
@@ -280,6 +283,12 @@ namespace ChatBridge
 		private readonly ConcurrentDictionary<string, DateTime> passwordLast =
 			new ConcurrentDictionary<string, DateTime>();
 
+		// 昵称 -> uid。服务器常常没有给 bot 身份授予 b_virtualserver_client_list，
+		// 那样按昵称没法列出客户端；这里记住在频道里说过话的人，按 uid 反查作退路。
+		// 进程重启即清空，只覆盖“最近开过口”的人。
+		private readonly ConcurrentDictionary<string, Uid> knownNames =
+			new ConcurrentDictionary<string, Uid>(StringComparer.OrdinalIgnoreCase);
+
 		private Regex trigger = null!;
 		// 客户端自动补全会把手动输入的 @昵称 改写成 "<@clientId|昵称>"（如 <@431|Mybot>），
 		// 也见过不带 id 的 "<@昵称>"。这是显式提及，与裸 @ 分开判定。
@@ -362,6 +371,10 @@ namespace ChatBridge
 				Log.Info("ChatBridge 收包 uid={0}.. target={1} len={2} hasAt={3} text=[{4}]",
 					uidDbg.Substring(0, Math.Min(4, uidDbg.Length)),
 					message.Target, message.Message.Length, message.Message.Contains('@'), preview);
+
+				// 不管有没有 @ 都记一笔：按昵称发消息时要靠它绕开缺失的 client list 权限。
+				if (message.InvokerUid is Uid invokerUid && !string.IsNullOrWhiteSpace(message.InvokerName))
+					knownNames[message.InvokerName.Trim()] = invokerUid;
 
 				// 私聊直通：TS3 私聊消息不带 @ 前缀，文本就是纯内容。
 				// 私聊本身已经是对着 bot 说的，不需要再要求 @。
@@ -708,10 +721,11 @@ namespace ChatBridge
 				return;
 			}
 
-			ClientList client;
+			ClientId targetId;
+			string targetName;
 			try
 			{
-				client = await ResolveSendTarget(target).ConfigureAwait(false);
+				(targetId, targetName) = await ResolveSendTarget(target).ConfigureAwait(false);
 			}
 			catch (Exception ex)
 			{
@@ -720,15 +734,15 @@ namespace ChatBridge
 				return;
 			}
 
-			var sent = await SendPrivate(client.ClientId, content).ConfigureAwait(false);
+			var sent = await SendPrivate(targetId, content).ConfigureAwait(false);
 			Log.Info("ChatBridge: 代发私信 {0} -> {1} (uid {2}.., {3} 字)，结果={4}",
-				message.InvokerName, client.Name, uid, content.Length, sent ? "成功" : "失败");
+				message.InvokerName, targetName, uid, content.Length, sent ? "成功" : "失败");
 
 			// 私聊场景不用再发一遍确认，否则用户会收到两条。
 			if (message.Target != TextMessageTargetMode.Private)
 			{
 				await Reply(message, sent
-					? "已发给 " + client.Name + "。"
+					? "已发给 " + targetName + "。"
 					: "发送失败，请确认对方在线且允许接收私信。").ConfigureAwait(false);
 			}
 		}
@@ -770,19 +784,63 @@ namespace ChatBridge
 			return target.Length > 0 && content.Length > 0;
 		}
 
-		private Task<ClientList> ResolveSendTarget(string target)
+		// 查询客户端同样要跑在 TS3 专用调度线程上，
+		// 否则底层会报 "Cannot call from an outside thread"。
+		private Task<(ClientId Id, string Label)> ResolveSendTarget(string target)
+			=> scheduler.InvokeAsync(() => ResolveSendTargetCore(target));
+
+		private async Task<(ClientId Id, string Label)> ResolveSendTargetCore(string target)
 		{
+			// #clientId 和 uid: 只查单个客户端，不需要 b_virtualserver_client_list；
+			// 昵称查找才依赖它，而 bot 身份常常没有被授予该权限。
 			if (target.Length > 1 && target[0] == '#'
 				&& ushort.TryParse(target.AsSpan(1), out var rawId))
 			{
-				return ts3.GetFallbackedClientById(new ClientId(rawId));
+				var id = new ClientId(rawId);
+				var info = await ts3.GetClientInfoById(id).ConfigureAwait(false);
+				return (id, string.IsNullOrWhiteSpace(info.Name) ? target : info.Name);
 			}
 
 			const string uidPrefix = "uid:";
 			if (target.StartsWith(uidPrefix, StringComparison.OrdinalIgnoreCase))
-				return ts3.GetClientByUid(new Uid(target.Substring(uidPrefix.Length)));
+			{
+				var ids = await ts3.GetClientIdsByUid(new Uid(target.Substring(uidPrefix.Length)))
+					.ConfigureAwait(false);
+				if (ids.Length == 0)
+					throw new InvalidOperationException("uid 不在线");
+				var first = ids[0];
+				return (first.ClientId, string.IsNullOrWhiteSpace(first.Name) ? target : first.Name);
+			}
 
-			return ts3.GetClientByName(target);
+			// 先看最近说过话的人：这条路不需要 client list 权限。
+			if (knownNames.TryGetValue(target.Trim(), out var knownUid))
+			{
+				try
+				{
+					var knownIds = await ts3.GetClientIdsByUid(knownUid).ConfigureAwait(false);
+					if (knownIds.Length > 0)
+					{
+						var known = knownIds[0];
+						return (known.ClientId, string.IsNullOrWhiteSpace(known.Name) ? target : known.Name);
+					}
+				}
+				catch
+				{
+					// 缓存过期就继续走下面的客户端列表。
+				}
+			}
+
+			try
+			{
+				var client = await ts3.GetClientByName(target).ConfigureAwait(false);
+				return (client.ClientId, client.Name);
+			}
+			catch (Exception ex)
+			{
+				throw new InvalidOperationException(
+					"按昵称查找需要 b_virtualserver_client_list 权限，或对方最近没在频道里说过话；"
+					+ "可改用 #clientId 或 uid:。原因：" + ex.Message);
+			}
 		}
 
 		// ── 歌单写操作 ──────────────────────────────────────────────
@@ -1267,7 +1325,8 @@ namespace ChatBridge
 			case "help":
 				return "status | play <link> | queue <link> | pause | resume | stop\n"
 					+ "next | prev | seek <秒> | volume [0-100|+N|-N]\n"
-					+ "playlist play <名字> | playlist queue <名字>";
+					+ "playlist play <名字> | playlist queue <名字>\n"
+					+ "send <目标> <内容>（目标可为昵称、#clientId 或 uid:...）";
 
 			case "status":
 				return DescribeStatus();
@@ -1315,6 +1374,9 @@ namespace ChatBridge
 
 			case "playlist":
 				return await PlaylistControl(arg).ConfigureAwait(false);
+
+			case "send":
+				return await ControlSend(arg).ConfigureAwait(false);
 
 			default:
 				throw new InvalidOperationException("未知命令：" + cmd + "（用 help 看列表）");
@@ -1370,6 +1432,37 @@ namespace ChatBridge
 			target = Math.Clamp(target, 0, 100);
 			await scheduler.Invoke(() => player.Volume = (float)target).ConfigureAwait(false);
 			return "音量已设为 " + target.ToString("0.#") + "。";
+		}
+
+		/// <summary>
+		/// 模型经控制通道发私信。送达方式与“私信”指令完全一致：
+		/// 正文原样送出，不转义、不截断、不过滤。
+		/// 控制通道已由 token 保护，且只绑回环，所以这里不再叠一层用户权限——
+		/// 能进沙箱发命令的就是模型自身，而它只在已授权用户的对话里运行。
+		/// </summary>
+		private async Task<string> ControlSend(string arg)
+		{
+			if (!TryParseSend(arg, out var target, out var content))
+				throw new InvalidOperationException("用法：send <目标> <内容>");
+
+			ClientId targetId;
+			string targetName;
+			try
+			{
+				(targetId, targetName) = await ResolveSendTarget(target).ConfigureAwait(false);
+			}
+			catch (Exception ex)
+			{
+				throw new InvalidOperationException("找不到目标「" + target + "」：" + ex.Message);
+			}
+
+			var sent = await SendPrivate(targetId, content).ConfigureAwait(false);
+			Log.Info("ChatBridge: 模型经控制通道代发私信 -> {0}（{1} 字），结果={2}",
+				targetName, content.Length, sent ? "成功" : "失败");
+			if (!sent)
+				throw new InvalidOperationException("私信发送失败，对方可能不允许接收私信");
+
+			return "已发给 " + targetName + "（" + content.Length + " 字）。";
 		}
 
 		private async Task<string> PlaylistControl(string arg)
