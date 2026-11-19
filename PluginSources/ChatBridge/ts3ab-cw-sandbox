@@ -1,0 +1,131 @@
+#!/bin/bash
+# ts3ab-cw-sandbox — 运行 codewhale 的白名单挂载沙箱。
+#
+# 边界由内核 mount namespace 强制，不依赖提示词或 codewhale 自身的策略：
+#   * 可见的宿主路径只有 /mystorage（外加只读的运行时依赖与 codewhale 私有 HOME）
+#   * /root、/home、/var/log、/etc 其余部分、其它挂载点一律不在命名空间内
+#   * /mystorage 默认只读；TS3AB_CW_RW=1 才可写，且 swapfile 始终被遮蔽
+#   * 工作区（--chdir）默认 /mystorage/audio；可用 TS3AB_CW_WORKDIR 覆盖
+#   * 只有 bot 自己的记忆库可写，且必须投影到工作区内才被 codewhale 放行：
+#       /mystorage/ds_memory/ts3ab-bot  --bind-->  $WORKDIR/.ts3ab-memory
+#     宿主机上的 .ts3ab-memory 是空挂载点，真实数据仍在 ds_memory/ts3ab-bot
+#   * 主机记忆库 memory.db 及其备份被遮蔽成 0 字节
+#
+# 调用者必须以 teamspeak 用户身份运行（systemd 单元里 User=teamspeak，
+# 手工调试时用 runuser -u teamspeak -- ts3ab-cw-sandbox ...）。
+
+set -euo pipefail
+
+CW_HOME="${CODEWHALE_HOME:-/var/lib/ts3ab-codewhale}"
+# 工作目录决定模型把哪里当成"当前项目"。当前设定为音乐库 /mystorage/audio。
+WORKDIR="${TS3AB_CW_WORKDIR:-/mystorage/audio}"
+RW="${TS3AB_CW_RW:-0}"
+# bot 专用记忆库：该目录可写，与主机记忆库物理隔离。
+MEM_ROOT="/mystorage/ds_memory/ts3ab-bot"
+# codewhale 的 workspace-write 只允许写 workspace 与 /tmp，而 /mystorage
+# 整体是只读挂载，所以 workspace 本身也不可写。记忆库必须同时满足两个
+# 条件才能用：出现在 workspace 内 + 该子目录被 bind 成 rw。
+# 因此把它挂到 workspace 下的 .ts3ab-memory（宿主侧是空挂载点）。
+MEM_MOUNT="$WORKDIR/.ts3ab-memory"
+MEM_DB="$MEM_MOUNT/memory.db"
+# bot 自建 skill 的落地目录：workspace 一级的 .ts3ab-skills。
+# 通过 CODEWHALE_HOME 的 skills_dir 指向它（config.toml 里已设置）。
+# 为何不用 <workspace>/.codewhale/skills：那个路径被 codewhale 硬性保护为只读
+# （即便 bind 成 rw 仍 EROFS）；符号链接也被拒绝（"must stay inside the workspace"）。
+# 内置技能已复制到此处，属主 root 只读，模型只能新建、不能改内置。
+SKILLS_DIR="$WORKDIR/.ts3ab-skills"
+
+if [ "$(id -u)" -eq 0 ]; then
+	echo "ts3ab-cw-sandbox: 拒绝以 root 运行（沙箱内的 AI 会继承 root 权限）" >&2
+	exit 78
+fi
+
+ARGS=(
+	--ro-bind /usr /usr
+	--symlink usr/lib64 /lib64
+	--symlink usr/bin /bin
+	--symlink usr/sbin /sbin
+	--ro-bind /etc/pki /etc/pki
+	--ro-bind /etc/ssl /etc/ssl
+	--ro-bind /etc/resolv.conf /etc/resolv.conf
+	--ro-bind /etc/hosts /etc/hosts
+	--ro-bind /etc/nsswitch.conf /etc/nsswitch.conf
+	--ro-bind /etc/passwd /etc/passwd
+	--ro-bind /etc/group /etc/group
+	--ro-bind /etc/localtime /etc/localtime
+	--proc /proc
+	--dev /dev
+	--tmpfs /tmp
+	--dir /var/lib
+	--bind "$CW_HOME" "$CW_HOME"
+)
+
+if [ "$RW" = "1" ]; then
+	ARGS+=(--bind /mystorage /mystorage)
+else
+	ARGS+=(--ro-bind /mystorage /mystorage)
+fi
+
+# swapfile 是内核可写回的内存镜像，绝不能交给模型读或写。
+if [ -f /mystorage/swapfile ]; then
+	ARGS+=(--ro-bind /dev/null /mystorage/swapfile)
+fi
+
+# bot 自己的记忆库目录覆写成可写（后挂载覆盖前面的只读挂载）。
+if [ -d "$MEM_ROOT" ]; then
+	ARGS+=(--bind "$MEM_ROOT" "$MEM_ROOT")
+fi
+
+# skill 目录同样要 bind 成 rw：workspace-write 只放行 workspace 内的写入，
+# 而 /mystorage 整体是只读挂载，需要这一层覆盖。
+if [ -d "$SKILLS_DIR" ]; then
+	ARGS+=(--bind "$SKILLS_DIR" "$SKILLS_DIR")
+fi
+
+# 再把记忆库投影到 workspace 内，让 codewhale 的 workspace-write 放行写入。
+# 挂载点必须在宿主侧预先存在（/mystorage 是只读挂载，bwrap 无法现场创建）。
+if [ -d "$MEM_ROOT" ] && [ -d "$MEM_MOUNT" ]; then
+	ARGS+=(--bind "$MEM_ROOT" "$MEM_MOUNT")
+fi
+
+# bot 配置文件含 TS3 客户端身份私钥（bots/*/bot.toml）与各类 api_key
+# （ts3audiobot.toml）。有网络之后，"可读"就等于"可外发"，必须遮蔽。
+# 注意要同时覆盖两处：仓库副本，和服务实际运行目录下的那份（后者才带真私钥）。
+for cred in /mystorage/git-repos/TS3AudioBot/bots/*/bot.toml \
+            /mystorage/git-repos/TS3AudioBot/TS3AudioBot/bin/*/netcoreapp*/bots/*/bot.toml \
+            /mystorage/git-repos/TS3AudioBot/ts3audiobot.toml \
+            /mystorage/git-repos/TS3AudioBot/TS3AudioBot/bin/*/netcoreapp*/ts3audiobot.toml; do
+	[ -f "$cred" ] && ARGS+=(--ro-bind "$CW_HOME/redacted.db" "$cred")
+done
+
+# 音频上传口令与它的盐：只能由 ChatBridge 插件私信分发。
+# 沙箱里遮蔽成 0 字节，模型即使被诱导也读不到，更不可能在频道里念出来。
+# 盐值（.config.js）泄露可离线推导任意小时的口令，一并遮蔽。
+for pwd_secret in /mystorage/git-repos/anonymous-chat/server/.audio_password \
+                  /mystorage/git-repos/anonymous-chat/server/.config.js; do
+	[ -f "$pwd_secret" ] && ARGS+=(--ro-bind "$CW_HOME/redacted.db" "$pwd_secret")
+done
+
+# 主机记忆库及其所有备份对沙箱不可见：频道里任何人都不该借 bot 之口
+# 读到你自己的记忆。用通配符，新增的 memory.db.bak-* 也自动被遮蔽。
+for hostdb in /mystorage/ds_memory/memory.db*; do
+	[ -f "$hostdb" ] && ARGS+=(--ro-bind "$CW_HOME/redacted.db" "$hostdb")
+done
+
+exec bwrap \
+	"${ARGS[@]}" \
+	--chdir "$WORKDIR" \
+	--unshare-pid --unshare-ipc --unshare-uts \
+	--die-with-parent \
+	--new-session \
+	--clearenv \
+	--setenv PATH /usr/local/bin:/usr/bin:/bin \
+	--setenv HOME "$CW_HOME" \
+	--setenv CODEWHALE_HOME "$CW_HOME" \
+	--setenv TMPDIR /tmp \
+	--setenv LANG C.UTF-8 \
+	--setenv LC_ALL C.UTF-8 \
+	--setenv TERM dumb \
+	--setenv SSL_CERT_FILE /etc/pki/tls/certs/ca-bundle.crt \
+	--setenv CODEWHALE_MEMORY_DB "$MEM_DB" \
+	"$@"

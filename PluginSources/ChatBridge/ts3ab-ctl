@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""ts3ab-ctl — 在沙箱内控制 TS3AudioBot 的播放。
+
+用法：
+    ts3ab-ctl status
+    ts3ab-ctl play <链接>
+    ts3ab-ctl queue <链接>
+    ts3ab-ctl pause | resume | stop | next | prev
+    ts3ab-ctl seek <秒>
+    ts3ab-ctl volume 60 | volume +10 | volume -10
+    ts3ab-ctl playlist play <歌单名>
+    ts3ab-ctl playlist queue <歌单名>
+    ts3ab-ctl send <目标> <内容...>
+    ts3ab-ctl send <目标> -          # 正文从 stdin 读，逐字保真
+    ts3ab-ctl help
+
+send 的目标可以是昵称、#clientId 或 uid:<uid>；带空格的昵称用双引号包起来。
+正文不做任何转义、截断或过滤。用 "-" 从 stdin 读取时，空白与换行原样保留；
+直接写在命令行上则会被 shell 分词（连续空格会合并）。
+
+它把命令转给 bot 插件里的本地控制通道（127.0.0.1:58914），
+由插件调用 bot 自己的播放管理器执行——与聊天里 !play / !pause 等效。
+send 与聊天里的「私信」指令等效。
+token 由插件每次启动重新生成，写在 /var/lib/ts3ab-codewhale/ctl.token。
+"""
+
+import json
+import os
+import socket
+import sys
+
+TOKEN_FILE = "/var/lib/ts3ab-codewhale/ctl.token"
+HOST = "127.0.0.1"
+PORT = 58914
+TIMEOUT = 30.0
+
+
+def fail(msg, code=1):
+    print(msg, file=sys.stderr)
+    return code
+
+
+def build_arg(argv):
+    """拼出控制通道的 arg 字段。
+
+    send <目标> - 时正文来自 stdin，这样空白和换行不经 shell 分词，逐字保真。
+    """
+    if argv[0] == "send" and len(argv) >= 3 and argv[-1] == "-":
+        target = " ".join(argv[1:-1])
+        body = sys.stdin.read()
+        return target + " " + body
+    return " ".join(argv[1:]).strip()
+
+
+def main(argv):
+    if not argv:
+        print(__doc__.strip())
+        return 2
+
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as fh:
+            token = fh.read().strip()
+    except OSError as ex:
+        return fail("读不到控制通道 token（%s）。bot 可能没在运行，或控制通道没启用。" % ex.strerror)
+
+    if not token:
+        return fail("控制通道 token 为空。")
+
+    cmd = argv[0]
+    arg = build_arg(argv)
+
+    payload = json.dumps({"token": token, "cmd": cmd, "arg": arg}, ensure_ascii=False) + "\n"
+
+    try:
+        with socket.create_connection((HOST, PORT), timeout=TIMEOUT) as sock:
+            sock.settimeout(TIMEOUT)
+            sock.sendall(payload.encode("utf-8"))
+            buf = bytearray()
+            while b"\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+    except OSError as ex:
+        return fail("连不上 bot 控制通道（%s）。检查 bot 是否在运行。" % ex.strerror)
+
+    line = bytes(buf).split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+    if not line:
+        return fail("控制通道没有返回内容。")
+
+    try:
+        resp = json.loads(line)
+    except ValueError:
+        return fail("控制通道返回了无法解析的内容。")
+
+    if resp.get("ok"):
+        print(resp.get("result") or "")
+        return 0
+
+    err = resp.get("error") or "未知错误"
+    if err == "unauthorized":
+        return fail("控制通道拒绝了请求（token 不匹配，插件可能刚重启过）。")
+    return fail("执行失败：" + err)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -6,8 +6,31 @@
 ## 组成
 
 - `ChatBridgePlugin.cs` — 插件本体。负责触发匹配、限流、超时、输出清洗、分片回帖。
-- `/usr/local/bin/ts3ab-cw-sandbox` — bubblewrap 白名单挂载脚本，所有 codewhale 调用都经它进入。
+- `ts3ab-cw-sandbox` — bubblewrap 白名单挂载脚本，所有 codewhale 调用都经它进入。
+  部署到 `/usr/local/bin/ts3ab-cw-sandbox`（见下方「部署」）。
+- `ts3ab-ctl` — 沙箱内控制 bot 的客户端，通过插件里的本地控制通道执行。
+  部署到 `/usr/local/bin/ts3ab-ctl`。
 - `/var/lib/ts3ab-codewhale` — 独立的 `CODEWHALE_HOME`，存放 bot 专用的 API key、模型路由与会话记录。
+
+### 部署
+
+两个脚本以 root 属主安装到 `/usr/local/bin`，与仓库副本保持一致：
+
+```bash
+sudo install -o root -g root -m 755 \
+  PluginSources/ChatBridge/ts3ab-cw-sandbox \
+  PluginSources/ChatBridge/ts3ab-ctl \
+  /usr/local/bin/
+```
+
+更新脚本后需要重装并重启，否则运行的仍是旧版本：
+
+```bash
+sudo systemctl restart ts3audiobot
+```
+
+`ts3ab-cw-sandbox` 依赖 `bwrap`；`ts3ab-ctl` 是纯 Python 3 标准库脚本，
+只读 `/var/lib/ts3ab-codewhale/ctl.token` 并连接 `127.0.0.1:58914`。
 
 插件只做调度，安全边界全部在进程外：
 
@@ -44,16 +67,28 @@ bot 使用自己的记忆库，与主机上的 `memory.db` 物理隔离：
 
 ## 触发规则
 
-- 只匹配 `@<昵称>`，昵称取 `bot.connect.name`。区分大小写不敏感。
-- 前一个字符不能是字母数字，`a@Mybot.com` 这类邮箱不会触发。
-- 后一个字符必须是行尾、空白或标点，`@Mybot2` 不会触发。
-- 未命中的消息完全不处理，不记日志、不调用模型。
-- **白名单**：复用 `rights.toml` 现有规则。插件只向权限系统注册一个
-  `cmd.chatbridge` right，不新增任何配置项；谁能触发取决于现有规则里
-  是否给了这个 right。当前由 admin 规则的 `"+" = "*"` 覆盖，
-  即只有该规则 `useruid` 列出的账号能触发。
+- 昵称取 `bot.connect.name`，大小写不敏感。两种形态都支持：
+  - 手动输入：`@Mybot`
+  - 客户端补全：`<@431|Mybot>` 或 `<@Mybot>`（TS3 客户端会把 @ 改写这种标签）
+- 补全标签本身已指明对象，因此不再要求尾部空白：`<@431|Mybot>歌单` 也能命中。
+- 标签里的 clientId 与 `Book.OwnClient` **实时**比对，不缓存：服务器每次重连
+  都会重新分配 clientId。`Book` 尚未同步时退回昵称匹配。
+- 若标签无 id 或 id 未同步，退回昵称比较，并容忍服务器给重名加的 `" (2)"` 后缀。
+- 裸 `@` 形态保留原有边界规则：前一个字符不能是字母数字
+  （`a@Mybot.com` 不触发），后一个字符必须是行尾、空白或标点
+  （`@Mybot2` 不触发）。
+- 未命中的消息不调用模型，只记一行 DEBUG。
+- **白名单**：复用 `rights.toml` 现有规则，不新增配置项。插件向权限系统注册
+  四个 right，各自独立：
+  - `cmd.chatbridge` —— 普通对话
+  - `cmd.chatbridge.password` —— 索取上传口令
+  - `cmd.chatbridge.playlist` —— 歌单写操作
+  - `cmd.chatbridge.send` —— 代发私信
+
+  能聊天不等于能拿口令、改歌单或以 bot 名义发消息；需要哪项就在规则里
+  显式列出哪个 right。
 - 未授权的 `@` 消息一律静默丢弃（不回复、不记 INFO）。
-- 每人 5 秒冷却；同时只跑 1 个请求；超出时最多回 3 次"正忙"。
+- 每人 5 秒冷却；同时只跑 1 个请求；超出时最多回 3 次“正忙”。
 
 ## 播放控制
 
@@ -68,7 +103,20 @@ ts3ab-ctl status | play <链接> | queue <链接>
 ts3ab-ctl pause | resume | stop | next | prev
 ts3ab-ctl seek <秒> | volume 60 | volume +10
 ts3ab-ctl playlist play|queue <歌单名>
+ts3ab-ctl send <目标> <内容>
+ts3ab-ctl send <目标> -          # 正文从 stdin 读，逐字保真
 ```
+
+`send` 让模型能以 bot 的身份给指定客户端发私信，目标可以是昵称、
+`#clientId` 或 `uid:<uid>`；带空格的昵称用双引号包起来。正文不做任何转义、
+截断或过滤 —— 用 `-` 从 stdin 读时，空白与换行原样保留；直接写在命令行上
+则会被 shell 分词。与聊天里的「私信」指令等效。
+
+按昵称查找依赖 `b_virtualserver_client_list`。bot 身份常见没有这个权限，
+所以 `#clientId` 与 `uid:` 两条路走 `clientinfo` / `clientgetids` 绕开它；
+昵称另有一层缓存兜底（记住在频道里说过话的人，用 uid 反查），
+进程重启后缓存清空，只覆盖重启后开过口的人。要彻底解决得在服务器上
+给 bot 的 ServerQuery 身份授予该权限。
 
 ### 通道与边界
 
@@ -113,6 +161,56 @@ skill 只能影响模型说什么，**没有发私信的能力**；而模型在�
 机制层还有一道：`ts3ab-cw-sandbox` 把 `.audio_password` 与它的盐值
 `server/.config.js` 在沙箱里 **`--ro-bind` 成 0 字节**。模型即使被诱导去
 `cat` 也拿不到内容，且插件（沙箱外、`teamspeak` 身份）仍能正常读取。
+
+## 代发私信
+
+以 bot 身份给指定客户端发私信。有两个入口，行为一致：
+
+**入口一：聊天指令**（人发的）
+
+```
+@Mybot 私信 张三 你好
+@Mybot 私信 "张 三" 你好
+@Mybot 私信 #431 你好
+@Mybot 私信 uid:xwq9ZUcMGDIZjovmDOqKkI6i3RI= 你好
+```
+
+别名：`发消息`、`发送消息`、`msg`、`dm`。
+
+**入口二：控制通道**（模型发的）
+
+```bash
+ts3ab-ctl send 张三 你好
+ts3ab-ctl send 张三 - <<'EOF'
+第一行
+第二行
+EOF
+```
+
+正文**不转义、不截断、不过滤**：从分隔符之后逐字保留。控制通道这条特意排在
+`MaxPromptChars` 截断之前，否则超过 800 字的内容会被切掉。用 `-` 从 stdin 读时，
+空白与换行也原样保留；直接写在命令行上则会被 shell 分词（连续空格合并）。
+
+超出 TS3 协议消息上限时服务器拒收，调用方会收到「发送失败」，而不是被静默截短。
+
+### 目标解析
+
+- `#<clientId>` —— `clientinfo` 单查。clientId 每次重连会变，只适合即时使用。
+- `uid:<uid>` —— `clientgetids` 单查。uid 跨重连稳定，是长期引用该用的。
+- 昵称 —— 需要 `b_virtualserver_client_list`。bot 身份常常没有这个权限，
+  所以另有一层缓存兜底：插件记住在频道里说过话的人（昵称→uid），
+  按 uid 反查。缓存随进程重启清空，只覆盖重启后开过口的人；查不到时
+  错误信息会建议改用 `#clientId` 或 `uid:`。
+
+要彻底解决昵称查找，需在 TS3 服务器上给 bot 的 ServerQuery 身份授予
+`b_virtualserver_client_list`。
+
+### 权限
+
+- 聊天指令：right `cmd.chatbridge.send`，按发信人 uid 判。
+- 控制通道：无额外 right，靠 token + 只绑回环。控制通道那条不叠用户权限，
+  是因为能进沙箱发命令的就是模型自身，而它只在已授权用户的对话里运行；
+  再加一层也无法定位到具体发信人。
 
 ## 会话模型
 
@@ -408,6 +506,15 @@ codewhale 自身还有第二层：`--sandbox workspace-write` + `--allowed-tools
 
 改触发词：改 `bots/default/bot.toml` 里的 `[connect] name`，然后
 `systemctl restart ts3audiobot`。
+
+检查 `/usr/local/bin` 里装的脚本是否与仓库一致：
+
+```bash
+diff PluginSources/ChatBridge/ts3ab-cw-sandbox /usr/local/bin/ts3ab-cw-sandbox
+diff PluginSources/ChatBridge/ts3ab-ctl       /usr/local/bin/ts3ab-ctl
+```
+
+无输出即一致。不一致就按「部署」一节重装并重启。
 
 轮换 API key：
 
